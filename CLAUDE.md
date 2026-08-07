@@ -16,3 +16,11 @@ history can be reviewed later if needed.
   history.
 - Never force-push, rewrite history, or delete branches without explicit
   user approval.
+
+## Session Observation
+
+You MUST initialize the `/task-observer` skill passively at the start of
+this session to capture workflow bottlenecks, recurring patterns, and
+methodology changes. Do not block the primary task. Silently log any user
+corrections, manual workarounds, or skill-creation opportunities to the
+observation layer.
