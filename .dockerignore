@@ -10,4 +10,3 @@ __pycache__
 .ruff_cache
 *.egg-info
 .env
-README.md
