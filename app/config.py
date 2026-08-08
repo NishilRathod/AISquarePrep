@@ -24,6 +24,7 @@ class Settings(BaseSettings):
         "New York",
         "Tokyo",
         "Sydney",
+        "Davanagere",
     ]
 
     default_page_size: int = 10

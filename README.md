@@ -39,7 +39,7 @@ cp .env.example .env
 | `OPENWEATHER_BACKOFF_BASE_SECONDS`   | `1.0`                                              | Backoff base when OpenWeather omits `Retry-After`. |
 | `REDIS_URL`                          | `redis://localhost:6379/0`                        | Overridden to `redis://redis:6379/0` in Compose. |
 | `CACHE_TTL_SECONDS`                  | `600`                                              | How long a city's weather stays cached.        |
-| `TRACKED_CITIES`                     | `London,Paris,New York,Tokyo,Sydney`               | Default city list for `GET /weather`.          |
+| `TRACKED_CITIES`                     | `London,Paris,New York,Tokyo,Sydney,Davanagere`    | Default city list for `GET /weather`.          |
 | `DEFAULT_PAGE_SIZE` / `MAX_PAGE_SIZE`| `10` / `50`                                        | Pagination defaults/limits.                    |
 
 ## Run with Docker Compose
