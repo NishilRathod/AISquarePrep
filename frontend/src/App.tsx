@@ -67,10 +67,42 @@ export default function App() {
 
   const weatherQuery = useWeather(pageCities);
 
-  const weatherByCity = useMemo(() => {
+  /**
+   * Pair each requested city with its reading.
+   *
+   * Name matching alone isn't enough: OpenWeather answers with its own canonical
+   * name, so tracking "Mysuru" comes back as "Mysore" and would look like missing
+   * data. The API preserves request order, so whatever is left over after the
+   * name pass can be zipped positionally — but only when the counts agree. If the
+   * server dropped an unknown city the counts differ, and guessing could label a
+   * card with another city's weather, so we show it as missing instead.
+   */
+  const weatherForCity = useMemo(() => {
     const items = weatherQuery.data?.items ?? [];
-    return new Map<string, Weather>(items.map((item) => [normalizeCity(item.city), item]));
-  }, [weatherQuery.data]);
+    const byName = new Map(items.map((item) => [normalizeCity(item.city), item]));
+
+    const resolved = new Map<string, Weather>();
+    const claimed = new Set<string>();
+    const unmatched: string[] = [];
+
+    for (const city of pageCities) {
+      const key = normalizeCity(city);
+      const hit = byName.get(key);
+      if (hit && !claimed.has(key)) {
+        resolved.set(city, hit);
+        claimed.add(key);
+      } else {
+        unmatched.push(city);
+      }
+    }
+
+    const spare = items.filter((item) => !claimed.has(normalizeCity(item.city)));
+    if (spare.length === unmatched.length) {
+      unmatched.forEach((city, index) => resolved.set(city, spare[index]));
+    }
+
+    return resolved;
+  }, [weatherQuery.data, pageCities]);
 
   // Land on whichever page the freshly added city ended up on. Resolved in an
   // effect rather than at click time because the tracked list arrives later.
@@ -165,7 +197,7 @@ export default function App() {
             <>
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 {pageCities.map((city) => {
-                  const weather = weatherByCity.get(normalizeCity(city));
+                  const weather = weatherForCity.get(city);
                   return weather ? (
                     <WeatherCard
                       key={city}

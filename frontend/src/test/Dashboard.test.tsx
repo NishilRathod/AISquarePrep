@@ -126,6 +126,26 @@ describe("Weather dashboard", () => {
     expect(screen.queryByTestId("skeleton-grid")).not.toBeInTheDocument();
   });
 
+  it("pairs a tracked city with the canonical name OpenWeather answers with", async () => {
+    // Tracking "Mysuru" comes back as "Mysore"; a name-only lookup would drop it.
+    mockApi({
+      tracked: { cities: ["London", "Mysuru"], defaults: ["London"] },
+      weather: {
+        items: [weather("London"), weather("Mysore", { country: "IN", temperature_c: 29.1 })],
+        page: 1,
+        page_size: 10,
+        total: 2,
+      },
+    });
+
+    renderApp();
+    await screen.findByRole("heading", { name: "London" });
+
+    expect(screen.getByRole("heading", { name: "Mysore" })).toBeInTheDocument();
+    expect(screen.getByText("29.1°")).toBeInTheDocument();
+    expect(screen.queryByText(/No data returned/)).not.toBeInTheDocument();
+  });
+
   it("surfaces the real status code and backend detail when the API errors", async () => {
     mockApi({
       tracked: { cities: ["London"], defaults: ["London"] },
