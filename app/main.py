@@ -1,13 +1,15 @@
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 
-from app.api import health, weather
+from app.api import cities, health, weather
 from app.clients.rate_limiter import AsyncTokenBucket
 from app.config import get_settings
 from app.exceptions import (
@@ -19,6 +21,22 @@ from app.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+
+def _cors_origins() -> list[str]:
+    """Browser origins allowed to call this API.
+
+    Read straight from the environment rather than through ``Settings``: this
+    module builds ``app`` at import time, and ``Settings.openweather_api_key``
+    has no default, so touching ``get_settings()`` here would make importing
+    ``app.main`` fail anywhere without a .env present.
+    """
+    raw = os.getenv("CORS_ALLOW_ORIGINS")
+    if not raw:
+        return _DEFAULT_CORS_ORIGINS
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
 @asynccontextmanager
@@ -37,8 +55,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(title="Weather Cache Service", lifespan=lifespan)
 
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins(),
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+
     app.include_router(health.router)
     app.include_router(weather.router)
+    app.include_router(cities.router)
 
     @app.exception_handler(CityNotFoundError)
     async def _city_not_found(request: Request, exc: CityNotFoundError) -> JSONResponse:
