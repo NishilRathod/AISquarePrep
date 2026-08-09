@@ -12,7 +12,35 @@ are throttled with an async token bucket and retried with backoff on
 |--------|------------------|-----------------------------------------------------------------------|
 | GET    | `/health`        | Redis connectivity check (never calls OpenWeather).                  |
 | GET    | `/weather/{city}`| Reshaped current weather for one city (cache-aside).                 |
-| GET    | `/weather`       | Paginated weather for multiple cities. `cities` (comma-separated, optional — defaults to `TRACKED_CITIES`), `page`, `page_size`. |
+| GET    | `/weather`       | Paginated weather for multiple cities. `cities` (comma-separated, optional — defaults to the tracked list), `page`, `page_size`. |
+| GET    | `/cities`        | Tracked cities, oldest-added first, plus the env-configured `defaults`. |
+| POST   | `/cities`        | Track a new city. `201` when added, `200` when already tracked.       |
+| GET    | `/cities/search` | Autocomplete over a vendored GeoNames index. `q` (min 2 chars), `limit`. |
+
+Cities added through `POST /cities` persist in Redis (`tracked:cities`) and are
+appended after the `TRACKED_CITIES` defaults, so `GET /weather` picks them up
+without a restart.
+
+## Web UI
+
+A React + TypeScript dashboard lives in [`frontend/`](frontend/). It lists the
+tracked cities, badges each reading `CACHED` or `LIVE` depending on whether it
+came from Redis or OpenWeather, and lets you search for and track new cities.
+
+```bash
+cd frontend
+npm install
+npm run dev     # http://localhost:5173
+```
+
+It expects the API on `http://localhost:8000`; override with
+`VITE_API_BASE_URL`. The API must allow the dev server's origin — see
+`CORS_ALLOW_ORIGINS`.
+
+City suggestions come from a vendored extract of the
+[GeoNames](https://www.geonames.org/) `cities15000` dataset, licensed
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Regenerate it with
+`python scripts/build_city_index.py`.
 
 ## Prerequisites
 
