@@ -50,6 +50,24 @@ export function formatTemperature(celsius: number): string {
 }
 
 /**
+ * Colour for a card's climate band, cold blue through hot rust.
+ *
+ * Redundant with the number by design: it lets the grid be read as a
+ * temperature map before any figure is, which is the whole point of showing
+ * nine cities at once. Stops rather than interpolation so the bands stay
+ * distinguishable from each other instead of blurring into one gradient.
+ */
+export function temperatureColor(celsius: number): string {
+  if (!Number.isFinite(celsius)) return "#a48f74";
+  if (celsius < 0) return "#3b6ea5";
+  if (celsius < 10) return "#5b9bc4";
+  if (celsius < 18) return "#56a78c";
+  if (celsius < 24) return "#c8973a";
+  if (celsius < 30) return "#d9722c";
+  return "#b03a12";
+}
+
+/**
  * Fold case and strip accents, mirroring `normalize()` in app/services/city_index.py
  * so the client and server agree on when two spellings are the same city.
  */

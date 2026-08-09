@@ -19,14 +19,10 @@ export function SourceBadge({ source }: { source: WeatherSource }) {
   return (
     <span
       title={title}
-      className="inline-flex items-center gap-1.5 text-[11px] font-semibold tracking-wider"
+      className="tabular inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-[0.12em]"
       style={{ color }}
     >
-      <span
-        aria-hidden="true"
-        className="size-1.5 rounded-full"
-        style={{ backgroundColor: color, boxShadow: `0 0 8px ${color}` }}
-      />
+      <span aria-hidden="true" className="size-1.5 rounded-full" style={{ backgroundColor: color }} />
       {text}
     </span>
   );

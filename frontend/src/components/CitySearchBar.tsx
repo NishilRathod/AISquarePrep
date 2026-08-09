@@ -99,10 +99,10 @@ export function CitySearchBar({ trackedCities, onCityAdded }: CitySearchBarProps
         }}
         onFocus={() => setIsOpen(true)}
         onKeyDown={onKeyDown}
-        className="w-full rounded-lg border px-4 py-2.5 text-sm outline-none transition-colors duration-150 placeholder:text-[var(--color-ink-faint)] focus:border-[var(--color-accent)]"
+        className="w-full rounded-lg border px-4 py-2.5 text-sm shadow-sm outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-[var(--color-ink-faint)] focus:border-[var(--color-accent)] focus:ring-2 focus:ring-[var(--color-accent)]/25"
         style={{
           backgroundColor: "var(--color-panel)",
-          borderColor: "var(--color-edge)",
+          borderColor: "var(--color-edge-strong)",
           color: "var(--color-ink)",
         }}
       />
@@ -139,12 +139,12 @@ export function CitySearchBar({ trackedCities, onCityAdded }: CitySearchBarProps
                 style={{
                   borderColor: "var(--color-edge)",
                   // Tracked rows read as green and refuse the click; only
-                  // selectable rows get the accent highlight.
+                  // selectable rows get the raised highlight.
                   backgroundColor: tracked
-                    ? "rgb(56 211 159 / 0.14)"
+                    ? "var(--color-live-tint)"
                     : active
                       ? "var(--color-panel-raised)"
-                      : "transparent",
+                      : "var(--color-panel)",
                   color: tracked ? "var(--color-live)" : "var(--color-ink)",
                   cursor: tracked ? "not-allowed" : "pointer",
                 }}

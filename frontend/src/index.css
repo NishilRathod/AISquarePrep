@@ -1,51 +1,71 @@
 @import "tailwindcss";
 
+/*
+ * Warm paper, technical type.
+ *
+ * Every foreground/background pair below was checked against WCAG AA rather
+ * than eyeballed; the first pass of this palette failed on three of them
+ * (tertiary text, the accent as text, and white on the accent), so these are
+ * the corrected values. Ratios in comments are against --color-panel unless
+ * noted.
+ */
 @theme {
-  --color-surface: #0b1220;
-  --color-panel: #131c2e;
-  --color-panel-raised: #1b2740;
-  --color-edge: #24314d;
-  --color-edge-strong: #35476d;
-  --color-ink: #e8edf7;
-  --color-ink-muted: #93a1bd;
-  --color-ink-faint: #6b7a99;
-  --color-accent: #5b8cff;
-  --color-accent-strong: #7ba3ff;
-  --color-cached: #f0b23e;
-  --color-live: #38d39f;
-  --color-danger: #ff6b6b;
+  --color-surface: #faf6f0;
+  --color-panel: #ffffff;
+  --color-panel-raised: #f5efe7;
+  --color-edge: #e7ddd0;
+  --color-edge-strong: #96826a; /* 3.69:1 on white, 3.42:1 on surface — control boundaries */
+  --color-ink: #2b2622; /* 14.97:1 */
+  --color-ink-muted: #6f6459; /*  5.76:1 */
+  --color-ink-faint: #7a6e60; /*  4.97:1 */
+  --color-accent: #b24e15; /*  5.26:1 white-on, 4.88:1 as text */
+  --color-accent-strong: #8a3a0b; /*  7.80:1 white-on */
+  --color-cached: #9a6410; /*  4.99:1 */
+  --color-live: #1f6f52; /*  6.08:1 */
+  --color-live-tint: #dcede4; /*  5.00:1 with --color-live on top */
+  --color-danger: #b3261e; /*  6.54:1 */
+
+  --font-sans: "IBM Plex Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Menlo, monospace;
 }
 
 html {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 body {
   background-color: var(--color-surface);
   color: var(--color-ink);
-  font-family:
-    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
-    sans-serif;
+  font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
 }
 
-/* A soft radial wash so the page doesn't read as a flat slab of navy. */
+/* One low wash so the paper has a little depth without becoming a gradient. */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
-  background:
-    radial-gradient(60rem 40rem at 15% -10%, rgb(91 140 255 / 0.14), transparent 70%),
-    radial-gradient(50rem 35rem at 95% 0%, rgb(56 211 159 / 0.08), transparent 70%);
+  background: radial-gradient(
+    70rem 45rem at 50% -20%,
+    rgb(178 78 21 / 0.07),
+    transparent 70%
+  );
+}
+
+/* Numerals line up column-to-column so nine readings can be compared at a glance. */
+.tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
 }
 
 @layer components {
   /*
-   * Every interactive control shares these states, since a button that looks
-   * identical pressed and unpressed is the fastest way to make a UI feel broken:
-   *   rest -> hover (lifts, lightens) -> active (presses back down)
-   *   -> focus-visible (accent ring, keyboard only) -> disabled (inert, no lift)
+   * Shared control states. A button that looks identical pressed and unpressed
+   * is the fastest way to make a UI feel broken, so each state is distinct:
+   *   rest -> hover (lifts) -> active (presses in) -> focus-visible (ring)
+   *   -> disabled (inert, no lift)
    */
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-lg border text-sm font-medium;
@@ -70,45 +90,47 @@ body::before {
   .btn-primary {
     background-color: var(--color-accent);
     border-color: var(--color-accent);
-    color: #06101f;
+    color: #ffffff;
   }
   .btn-primary:hover:not(:disabled) {
     background-color: var(--color-accent-strong);
     border-color: var(--color-accent-strong);
     transform: translateY(-1px);
-    box-shadow: 0 6px 18px -6px rgb(91 140 255 / 0.7);
+    box-shadow: 0 8px 18px -8px rgb(138 58 11 / 0.55);
   }
   .btn-primary:active:not(:disabled) {
     transform: translateY(1px);
-    box-shadow: inset 0 2px 6px rgb(0 0 0 / 0.35);
-    background-color: #4a7bef;
+    background-color: #732f09;
+    box-shadow: inset 0 2px 5px rgb(60 25 6 / 0.4);
   }
 
   .btn-ghost {
     background-color: var(--color-panel);
-    border-color: var(--color-edge);
+    border-color: var(--color-edge-strong);
     color: var(--color-ink);
   }
   .btn-ghost:hover:not(:disabled):not([aria-disabled="true"]) {
     background-color: var(--color-panel-raised);
-    border-color: var(--color-edge-strong);
+    border-color: var(--color-accent);
+    color: var(--color-accent-strong);
     transform: translateY(-1px);
   }
   .btn-ghost:active:not(:disabled):not([aria-disabled="true"]) {
     transform: translateY(1px);
-    background-color: #0f1728;
-    box-shadow: inset 0 2px 6px rgb(0 0 0 / 0.4);
+    background-color: #ece2d5;
+    box-shadow: inset 0 2px 5px rgb(43 38 34 / 0.16);
   }
 
   .card {
-    @apply rounded-xl border p-4 transition-[transform,border-color,box-shadow] duration-200;
+    @apply overflow-hidden rounded-xl border transition-[transform,border-color,box-shadow] duration-200;
     background-color: var(--color-panel);
     border-color: var(--color-edge);
+    box-shadow: 0 1px 2px rgb(43 38 34 / 0.05);
   }
   .card:hover {
     border-color: var(--color-edge-strong);
     transform: translateY(-2px);
-    box-shadow: 0 14px 30px -20px rgb(0 0 0 / 0.9);
+    box-shadow: 0 12px 26px -18px rgb(43 38 34 / 0.45);
   }
 }
 
@@ -127,7 +149,7 @@ body::before {
   position: absolute;
   inset: 0;
   transform: translateX(-100%);
-  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.06), transparent);
+  background: linear-gradient(90deg, transparent, rgb(43 38 34 / 0.05), transparent);
   animation: shimmer 1.6s infinite;
 }
 

@@ -25,8 +25,8 @@ export function ErrorState({ error, onRetry }: ErrorStateProps) {
       <div className="flex flex-wrap items-center gap-2">
         {status !== null && (
           <span
-            className="rounded-md px-2 py-0.5 font-mono text-xs font-semibold"
-            style={{ backgroundColor: "rgb(255 107 107 / 0.16)", color: "var(--color-danger)" }}
+            className="tabular rounded-md px-2 py-0.5 text-xs font-semibold"
+            style={{ backgroundColor: "#fbe9e7", color: "var(--color-danger)" }}
           >
             {status}
           </span>

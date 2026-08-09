@@ -24,14 +24,14 @@ export function HealthPill() {
 
   return (
     <span
-      className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs"
-      style={{ borderColor: "var(--color-edge)", color: "var(--color-ink-muted)" }}
+      className="tabular inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px]"
+      style={{
+        borderColor: "var(--color-edge)",
+        backgroundColor: "var(--color-panel)",
+        color: "var(--color-ink-muted)",
+      }}
     >
-      <span
-        aria-hidden="true"
-        className="size-2 rounded-full"
-        style={{ backgroundColor: color, boxShadow: `0 0 8px ${color}` }}
-      />
+      <span aria-hidden="true" className="size-2 rounded-full" style={{ backgroundColor: color }} />
       {label}
     </span>
   );

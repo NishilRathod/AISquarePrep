@@ -22,13 +22,13 @@ export function Pagination({ page, pageCount, onChange }: PaginationProps) {
           key={value}
           onClick={() => onChange(value)}
           aria-current={value === page ? "page" : undefined}
-          className="!px-3 tabular-nums"
+          className="tabular !px-3"
           style={
             value === page
               ? {
                   borderColor: "var(--color-accent)",
-                  color: "var(--color-accent-strong)",
-                  backgroundColor: "rgb(91 140 255 / 0.12)",
+                  color: "#ffffff",
+                  backgroundColor: "var(--color-accent)",
                 }
               : undefined
           }

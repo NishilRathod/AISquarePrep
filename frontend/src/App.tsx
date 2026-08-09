@@ -19,7 +19,8 @@ import {
   writeTrackedMirror,
 } from "./lib/storage";
 
-const PAGE_SIZE = 10;
+// Nine fills the 3-column grid exactly, so no page ends on a ragged row.
+const PAGE_SIZE = 9;
 
 export default function App() {
   const [page, setPage] = useState(1);
@@ -148,11 +149,11 @@ export default function App() {
 
   return (
     <div className="relative min-h-dvh">
-      <div className="relative mx-auto max-w-6xl px-5 py-10 sm:px-8">
-        <header className="flex flex-wrap items-start justify-between gap-4">
+      <div className="relative mx-auto max-w-6xl px-5 py-6 sm:px-8">
+        <header className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Weather Cache</h1>
-            <p className="mt-1 text-sm" style={{ color: "var(--color-ink-muted)" }}>
+            <h1 className="text-xl font-semibold tracking-tight">Weather Cache</h1>
+            <p className="mt-0.5 text-[13px]" style={{ color: "var(--color-ink-muted)" }}>
               Tracked cities, and whether each reading came from Redis or upstream.
             </p>
           </div>
@@ -166,7 +167,7 @@ export default function App() {
         </header>
 
         {/* Distinguishes a background refetch from a cold load. */}
-        <div className="mt-5 h-0.5 overflow-hidden rounded-full">
+        <div className="mt-3 h-0.5 overflow-hidden rounded-full">
           {isRefreshing && !isInitialLoad && (
             <div
               className="h-full w-1/3 animate-pulse rounded-full"
@@ -175,16 +176,20 @@ export default function App() {
           )}
         </div>
 
-        <div className="mt-4 max-w-md">
+        <div className="mx-auto mt-3 w-full max-w-xl">
           <CitySearchBar trackedCities={trackedCities} onCityAdded={setPendingCity} />
           {pinNotice && (
-            <p role="status" className="mt-2 text-xs" style={{ color: "var(--color-cached)" }}>
+            <p
+              role="status"
+              className="mt-2 text-center text-xs"
+              style={{ color: "var(--color-accent-strong)" }}
+            >
               {pinNotice}
             </p>
           )}
         </div>
 
-        <main className="mt-8">
+        <main className="mt-6">
           {error ? (
             <ErrorState error={error} onRetry={refresh} />
           ) : isInitialLoad ? (
@@ -212,7 +217,7 @@ export default function App() {
                 })}
               </div>
 
-              <div className="mt-8">
+              <div className="mt-6">
                 <Pagination page={safePage} pageCount={pageCount} onChange={setPage} />
               </div>
             </>
@@ -220,20 +225,15 @@ export default function App() {
         </main>
 
         <footer
-          className="mt-10 border-t pt-5 text-xs leading-relaxed"
+          className="mt-6 border-t pt-3 text-[11px] leading-relaxed"
           style={{ borderColor: "var(--color-edge)", color: "var(--color-ink-faint)" }}
         >
           <p>
-            This API is cache-aside: a city already in Redis is served from cache (
-            <span style={{ color: "var(--color-cached)" }}>CACHED</span>), and a miss is fetched
-            from OpenWeather and then cached (
-            <span style={{ color: "var(--color-live)" }}>LIVE</span>). Loading this page can
-            therefore populate the cache — it isn't a passive view of it. Entries expire after 10
-            minutes.
-          </p>
-          <p className="mt-2">
-            API: <code>{API_BASE_URL}</code> · Pins are stored in this browser; tracked cities are
-            stored on the server. City data ©{" "}
+            Cache-aside: <span style={{ color: "var(--color-cached)" }}>CACHED</span> came from
+            Redis, <span style={{ color: "var(--color-live)" }}>LIVE</span> was just fetched from
+            OpenWeather and stored — so loading this page can populate the cache rather than only
+            observe it. Entries expire after 10 minutes. Pins are per-browser; tracked cities live
+            on the server. <code>{API_BASE_URL}</code> · City data ©{" "}
             <a
               href="https://www.geonames.org/"
               target="_blank"
