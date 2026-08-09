@@ -20,6 +20,7 @@ npm-debug.log*
 node_modules/
 dist/
 build/
+*.tsbuildinfo
 
 # Python
 __pycache__/
