@@ -1,5 +1,3 @@
-import time
-
 from redis.asyncio import Redis
 
 from app.services.city_index import normalize
@@ -10,15 +8,21 @@ class TrackedCitiesService:
 
     ``Settings.tracked_cities`` is env config read once behind an ``lru_cache``,
     so it cannot be appended to while the app runs. Additions therefore live in a
-    Redis sorted set scored by insertion time -- a sorted set rather than a plain
-    set because the UI orders cities oldest-added first, and ``ZADD NX`` keeps a
-    re-add from bumping a city's position.
+    Redis sorted set ordered by an insertion counter -- a sorted set rather than a
+    plain set because the UI orders cities oldest-added first, and ``ZADD NX``
+    keeps a re-add from bumping a city's position.
+
+    Scores come from ``INCR`` rather than a timestamp: a clock only has so much
+    resolution (~15ms on Windows), and two cities added in the same tick would
+    tie, at which point Redis falls back to sorting them alphabetically and the
+    "oldest first" guarantee quietly breaks.
 
     The env defaults are treated as the oldest entries and always lead the list.
     Unlike cached weather this key carries no TTL: it is user intent, not a cache.
     """
 
     KEY = "tracked:cities"
+    SEQ_KEY = "tracked:seq"
 
     def __init__(self, redis: Redis, defaults: list[str]):
         self._redis = redis
@@ -55,5 +59,6 @@ class TrackedCitiesService:
         if normalize(display) in existing:
             return False
 
-        await self._redis.zadd(self.KEY, {display: time.time()}, nx=True)
+        score = await self._redis.incr(self.SEQ_KEY)
+        await self._redis.zadd(self.KEY, {display: score}, nx=True)
         return True
