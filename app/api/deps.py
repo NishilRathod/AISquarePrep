@@ -8,6 +8,7 @@ from app.clients.openweather import OpenWeatherClient
 from app.clients.rate_limiter import AsyncTokenBucket
 from app.config import Settings, get_settings
 from app.services.cache import CacheService
+from app.services.tracked import TrackedCitiesService
 from app.services.weather import WeatherService
 
 
@@ -46,5 +47,10 @@ def get_weather_service(
     return WeatherService(cache, client)
 
 
+def get_tracked_cities_service(redis: RedisDep, settings: SettingsDep) -> TrackedCitiesService:
+    return TrackedCitiesService(redis, settings.tracked_cities)
+
+
 CacheServiceDep = Annotated[CacheService, Depends(get_cache_service)]
 WeatherServiceDep = Annotated[WeatherService, Depends(get_weather_service)]
+TrackedCitiesServiceDep = Annotated[TrackedCitiesService, Depends(get_tracked_cities_service)]
