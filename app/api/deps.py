@@ -68,7 +68,13 @@ def get_anomaly_board_service(
     client: Annotated[OpenMeteoClient, Depends(get_open_meteo_client)],
     briefer: Annotated[object, Depends(get_briefing_provider)],
 ) -> AnomalyBoardService:
-    return AnomalyBoardService(redis, client, settings.anomaly_board_size, briefer)  # type: ignore[arg-type]
+    return AnomalyBoardService(
+        redis,
+        client,
+        settings.anomaly_board_size,
+        briefer,  # type: ignore[arg-type]
+        settings.anomaly_briefing_cache_ttl_seconds,
+    )
 
 
 CacheServiceDep = Annotated[CacheService, Depends(get_cache_service)]

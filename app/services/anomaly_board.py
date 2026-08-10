@@ -8,6 +8,7 @@ on an LLM.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import UTC, datetime
 
@@ -22,6 +23,11 @@ from app.services.normals import NormalsStore, NormalsUnavailableError, load_nor
 logger = logging.getLogger(__name__)
 
 BOARD_KEY = "anomalies:board"
+BRIEFING_KEY_PREFIX = "anomalies:briefing:"
+
+# How many rows the briefing sees. Slightly more than are displayed, so it can
+# tell that a cluster continues past the visible cut.
+BRIEFING_ROWS = 15
 
 
 class AnomalyBoardService:
@@ -31,11 +37,13 @@ class AnomalyBoardService:
         client: OpenMeteoClient,
         board_size: int,
         briefer: BriefingProvider | None = None,
+        briefing_ttl_seconds: int = 21600,
     ):
         self._redis = redis
         self._client = client
         self._board_size = board_size
         self._briefer = briefer
+        self._briefing_ttl_seconds = briefing_ttl_seconds
 
     async def get_board(self, limit: int) -> AnomalyBoard:
         """Serve the stored board. Never sweeps, never blocks on upstream."""
@@ -121,11 +129,42 @@ class AnomalyBoardService:
     async def _brief(self, rows: list[AnomalyRow]) -> AnomalyBriefing | None:
         if self._briefer is None or not rows:
             return None
+
+        subject = rows[:BRIEFING_ROWS]
+        key = BRIEFING_KEY_PREFIX + self._briefing_digest(subject)
+
+        # Keyed by the rows themselves rather than by time, so a sweep that
+        # reproduces the same board -- or a manual refresh during development --
+        # costs nothing.
+        cached = await self._redis.get(key)
+        if cached is not None:
+            return AnomalyBriefing.model_validate_json(cached)
+
         try:
-            return await self._briefer.brief(rows)
+            briefing = await self._briefer.brief(subject)
         except Exception:  # noqa: BLE001 - enrichment must never fail a sweep
             logger.warning("Anomaly briefing failed; serving board without it", exc_info=True)
             return None
+
+        if briefing is not None:
+            await self._redis.set(
+                key, briefing.model_dump_json(), ex=self._briefing_ttl_seconds
+            )
+        return briefing
+
+    @staticmethod
+    def _briefing_digest(rows: list[AnomalyRow]) -> str:
+        """Identity of a board, for caching.
+
+        Only the fields that would change what a briefing says: which cities,
+        how anomalous, and in which direction. Rank is excluded because a pure
+        reordering of the same cities with the same magnitudes reads the same.
+        """
+        material = "|".join(
+            f"{row.city},{row.country},{row.z_score},{row.driver},{row.direction}"
+            for row in rows
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 class BriefingProvider:

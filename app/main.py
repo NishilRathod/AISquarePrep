@@ -75,6 +75,7 @@ async def _sweep_loop(app: FastAPI, settings: Settings) -> None:
                 OpenMeteoClient(app.state.http_client, settings),
                 settings.anomaly_board_size,
                 app.state.briefer,
+                settings.anomaly_briefing_cache_ttl_seconds,
             )
             await service.sweep()
         except asyncio.CancelledError:
