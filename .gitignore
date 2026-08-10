@@ -30,3 +30,6 @@ venv/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+
+# Climate-normals fetch checkpoints (resumable build state, not artefacts)
+app/data/.climate_normals.*.checkpoint.jsonl

@@ -17,6 +17,11 @@ def _env(monkeypatch):
     monkeypatch.setenv("DEFAULT_PAGE_SIZE", "2")
     monkeypatch.setenv("MAX_PAGE_SIZE", "10")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6399/0")
+    # The sweep is global scheduled work against a live upstream. Tests drive
+    # sweeps explicitly where they need one.
+    monkeypatch.setenv("ANOMALY_SWEEP_ENABLED", "false")
+    monkeypatch.setenv("ANOMALY_DEFAULT_LIMIT", "10")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

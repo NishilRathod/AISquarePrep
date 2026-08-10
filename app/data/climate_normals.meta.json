@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "n_cities": 40,
+  "months": 12,
+  "stats": 4,
+  "stat_order": [
+    "mean_temperature_c",
+    "sd_temperature_c",
+    "mean_humidity_pct",
+    "sd_humidity_pct"
+  ],
+  "cities_covered": 40,
+  "window_start": "2023-01-01",
+  "window_end": "2025-12-31",
+  "years": 3,
+  "min_samples": 20,
+  "geonameid_sha256": "c4ef176a7433fc5fa5e6dcf7ba6f4d095dc758ad28131a00402e6237287542b0",
+  "built_at": "2026-08-10T14:14:11.944134+00:00",
+  "source": "Open-Meteo ERA5 reanalysis (archive-api.open-meteo.com)"
+}
