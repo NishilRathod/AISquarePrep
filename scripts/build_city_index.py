@@ -1,9 +1,18 @@
-"""Build the static city index used by ``GET /cities/search``.
+"""Build the static city index used by ``GET /cities/search`` and the anomaly sweep.
 
 Downloads the GeoNames ``cities15000`` dump (every city with population > 15,000)
-and trims it to the four fields the autocomplete actually needs. The raw dump is
-~12 MB, almost entirely because of the ``alternatenames`` column; dropping it
-takes the vendored artefact down to roughly 1 MB.
+and trims it to the fields we actually need. The raw dump is ~12 MB, almost
+entirely because of the ``alternatenames`` column; dropping it takes the vendored
+artefact down to roughly 2 MB.
+
+Four fields serve the autocomplete (name, state, country, population). Three more
+serve the global anomaly board:
+
+* ``geonameid`` is the stable join key between this index and the climate-normals
+  artefact. City names repeat across countries and regions, so joining those two
+  files on name would silently misattribute anomalies; an integer id cannot.
+* ``latitude`` / ``longitude`` are what the bulk weather APIs are keyed by. Without
+  them there is no way to ask for current conditions across the whole index.
 
 Run once and commit the output:
 
@@ -26,10 +35,16 @@ ADMIN1_URL = "https://download.geonames.org/export/dump/admin1CodesASCII.txt"
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "app" / "data" / "cities15000.json"
 
 # Column offsets in the GeoNames cities dump (tab-separated, no header row).
+COL_GEONAMEID = 0
 COL_NAME = 1
+COL_LATITUDE = 4
+COL_LONGITUDE = 5
 COL_COUNTRY = 8
 COL_ADMIN1 = 10
 COL_POPULATION = 14
+
+# Index into the *output* row, which is not the same shape as the input line.
+OUT_POPULATION = 4
 
 
 def _download(url: str) -> bytes:
@@ -75,14 +90,29 @@ def _load_cities(admin1_names: dict[str, str]) -> list[list[object]]:
         except ValueError:
             population = 0
 
+        # A city with no usable coordinates cannot be swept for anomalies, and a
+        # row without an id cannot be joined to the normals artefact. Both are
+        # malformed rather than merely sparse, so drop them here instead of
+        # carrying nulls through every downstream consumer.
+        try:
+            geonameid = int(fields[COL_GEONAMEID])
+            latitude = round(float(fields[COL_LATITUDE]), 4)
+            longitude = round(float(fields[COL_LONGITUDE]), 4)
+        except ValueError:
+            continue
+
         key = (name.casefold(), state.casefold(), country)
         existing = best.get(key)
-        if existing is None or population > int(existing[3]):  # type: ignore[arg-type]
-            best[key] = [name, state, country, population]
+        if existing is None or population > int(existing[OUT_POPULATION]):  # type: ignore[arg-type]
+            best[key] = [geonameid, name, state, country, population, latitude, longitude]
 
     # Population-descending, so the search can rank by relevance without re-sorting
-    # the whole index on every keystroke.
-    return sorted(best.values(), key=lambda row: int(row[3]), reverse=True)  # type: ignore[arg-type]
+    # the whole index on every keystroke. The anomaly sweep also relies on this
+    # ordering being stable: the normals artefact is written in index order.
+    return sorted(
+        best.values(),
+        key=lambda row: (-int(row[OUT_POPULATION]), int(row[0])),  # type: ignore[arg-type]
+    )
 
 
 def main() -> None:

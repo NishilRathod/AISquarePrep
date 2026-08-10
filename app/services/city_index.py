@@ -1,5 +1,6 @@
 import json
 import unicodedata
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -8,6 +9,24 @@ from app.models.city import CitySuggestion
 INDEX_PATH = Path(__file__).resolve().parent.parent / "data" / "cities15000.json"
 
 MIN_QUERY_LENGTH = 2
+
+
+@dataclass(frozen=True, slots=True)
+class CityRecord:
+    """One row of the vendored GeoNames extract.
+
+    ``row_index`` is the city's position in the index and doubles as its offset
+    into the climate-normals artefact, which is written in the same order.
+    """
+
+    row_index: int
+    geonameid: int
+    name: str
+    state: str
+    country: str
+    population: int
+    latitude: float
+    longitude: float
 
 
 def normalize(value: str) -> str:
@@ -21,8 +40,8 @@ def normalize(value: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def _index() -> list[tuple[str, CitySuggestion]]:
-    """Load the vendored GeoNames extract once, paired with a normalized name.
+def city_records() -> list[CityRecord]:
+    """Load the vendored GeoNames extract once.
 
     The file is already sorted population-descending, so a prefix scan yields
     the most significant cities first without re-sorting per keystroke.
@@ -31,11 +50,42 @@ def _index() -> list[tuple[str, CitySuggestion]]:
         rows = json.load(handle)
 
     return [
-        (
-            normalize(name),
-            CitySuggestion(name=name, state=state, country=country, population=population),
+        CityRecord(
+            row_index=row_index,
+            geonameid=geonameid,
+            name=name,
+            state=state,
+            country=country,
+            population=population,
+            latitude=latitude,
+            longitude=longitude,
         )
-        for name, state, country, population in rows
+        for row_index, (
+            geonameid,
+            name,
+            state,
+            country,
+            population,
+            latitude,
+            longitude,
+        ) in enumerate(rows)
+    ]
+
+
+@lru_cache(maxsize=1)
+def _index() -> list[tuple[str, CitySuggestion]]:
+    """Search view over the index: each city paired with its normalized name."""
+    return [
+        (
+            normalize(record.name),
+            CitySuggestion(
+                name=record.name,
+                state=record.state,
+                country=record.country,
+                population=record.population,
+            ),
+        )
+        for record in city_records()
     ]
 
 
