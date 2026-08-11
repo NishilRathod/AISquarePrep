@@ -1,5 +1,4 @@
-import type { AnomalyBriefing, AnomalyRow } from "../api/types";
-import { AnomalyBriefingPanel } from "./AnomalyBriefingPanel";
+import type { AnomalyRow } from "../api/types";
 
 /**
  * Diverging pair for signed anomalies: warm above normal, cool below.
@@ -23,23 +22,21 @@ function barWidth(z: number): number {
   return Math.min((z / FULL_SCALE_Z) * 100, 100);
 }
 
-function observedFor(row: AnomalyRow): { observed: string; normal: string; unit: string } {
+function observedFor(row: AnomalyRow): { observed: string; normal: string } {
   return row.driver === "temperature"
     ? {
         observed: row.temperature_c.toFixed(1),
         normal: row.normal_temperature_c.toFixed(1),
-        unit: "°C",
       }
     : {
         observed: String(Math.round(row.humidity_pct)),
         normal: row.normal_humidity_pct.toFixed(0),
-        unit: "%",
       };
 }
 
-function AnomalyRowItem({ row }: { row: AnomalyRow }) {
+function AnomalyRowItem({ row, unit }: { row: AnomalyRow; unit: string }) {
   const colour = row.direction === "above" ? ABOVE : BELOW;
-  const { observed, normal, unit } = observedFor(row);
+  const { observed, normal } = observedFor(row);
   const width = barWidth(row.z_score);
 
   return (
@@ -60,7 +57,7 @@ function AnomalyRowItem({ row }: { row: AnomalyRow }) {
           </span>
         </div>
         <p className="tabular mt-0.5 text-[11px]" style={{ color: "var(--color-ink-muted)" }}>
-          {row.driver === "temperature" ? "temp" : "humidity"} {observed}
+          {observed}
           {unit} · normal {normal}
           {unit}
         </p>
@@ -96,39 +93,40 @@ function AnomalyRowItem({ row }: { row: AnomalyRow }) {
 }
 
 interface AnomalyBoardProps {
+  /** "Temperature" or "Humidity" — the variable this board is ranked on. */
+  title: string;
+  unit: string;
   rows: AnomalyRow[];
   citiesScored: number;
   sweptAt: string | null;
-  /** Null when the interpretation layer is unavailable; the board is unaffected. */
-  briefing: AnomalyBriefing | null;
 }
 
-export function AnomalyBoard({ rows, citiesScored, sweptAt, briefing }: AnomalyBoardProps) {
+export function AnomalyBoard({ title, unit, rows, citiesScored, sweptAt }: AnomalyBoardProps) {
+  const headingId = `anomaly-${title.toLowerCase()}`;
+
   return (
-    <section aria-labelledby="anomaly-heading" className="card mt-6 p-4">
+    <section aria-labelledby={headingId} className="card p-4">
       <header className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-        <h2 id="anomaly-heading" className="text-[15px] font-semibold">
-          Most anomalous cities on Earth
+        <h2 id={headingId} className="text-[15px] font-semibold">
+          Most anomalous — {title.toLowerCase()}
         </h2>
         <p className="tabular text-[11px]" style={{ color: "var(--color-ink-faint)" }}>
-          {citiesScored.toLocaleString()} cities scored
+          {citiesScored.toLocaleString()} scored
           {sweptAt && ` · ${new Date(sweptAt).toLocaleTimeString()}`}
         </p>
       </header>
 
-      <p className="mt-1 text-[12px] leading-relaxed" style={{ color: "var(--color-ink-muted)" }}>
-        Ranked by standardized anomaly — how many standard deviations today's local daily mean
-        sits from that city's own normal for this month. Each city is measured against itself,
-        which is what makes very different climates comparable.
-      </p>
-
-      <AnomalyBriefingPanel briefing={briefing} />
-
-      <ol className="mt-2 divide-y" style={{ borderColor: "var(--color-edge)" }}>
-        {rows.map((row) => (
-          <AnomalyRowItem key={`${row.city}-${row.country}-${row.rank}`} row={row} />
-        ))}
-      </ol>
+      {rows.length === 0 ? (
+        <p className="mt-3 text-[12px]" style={{ color: "var(--color-ink-faint)" }}>
+          Nothing unusual in {title.toLowerCase()} right now.
+        </p>
+      ) : (
+        <ol className="mt-2 divide-y" style={{ borderColor: "var(--color-edge)" }}>
+          {rows.map((row) => (
+            <AnomalyRowItem key={`${row.city}-${row.country}-${row.rank}`} row={row} unit={unit} />
+          ))}
+        </ol>
+      )}
     </section>
   );
 }

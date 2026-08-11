@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -38,7 +39,17 @@ function anomalyRow(city: string, overrides: Partial<AnomalyRow> = {}): AnomalyR
 
 function anomalyBoard(overrides: Partial<AnomalyBoard> = {}): AnomalyBoard {
   return {
-    rows: [anomalyRow("Hong Kong")],
+    temperature: [
+      anomalyRow("Johannesburg", {
+        country: "ZA",
+        driver: "temperature",
+        temperature_c: 1.4,
+        normal_temperature_c: 13.4,
+        z_temperature: -3.82,
+        z_score: 3.82,
+      }),
+    ],
+    humidity: [anomalyRow("Hong Kong")],
     briefing: null,
     swept_at: new Date().toISOString(),
     cities_scored: 2000,
@@ -127,7 +138,8 @@ function mockApi(config: RouteConfig) {
       return jsonResponse(
         configured ??
           ({
-            rows: [],
+            temperature: [],
+            humidity: [],
             briefing: null,
             swept_at: null,
             cities_scored: 0,
@@ -143,11 +155,15 @@ function mockApi(config: RouteConfig) {
   return { fetchMock, postedCities };
 }
 
-function renderApp(ui: ReactElement = <App />) {
+function renderApp(ui: ReactElement = <App />, route = "/") {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>
+    </QueryClientProvider>,
+  );
 }
 
 beforeEach(() => {
@@ -275,57 +291,60 @@ describe("Weather dashboard", () => {
   });
 });
 
-describe("Global anomaly board", () => {
+describe("Anomalies page", () => {
   const tracked = { cities: ["London"], defaults: ["London"] };
-  const weatherPage = {
-    items: [weather("London")],
-    page: 1,
-    page_size: 10,
-    total: 1,
-  };
+  const weatherPage = { items: [weather("London")], page: 1, page_size: 10, total: 1 };
 
-  it("ranks cities and shows the numbers the ranking is derived from", async () => {
-    mockApi({
-      tracked,
-      weather: weatherPage,
-      anomalies: anomalyBoard({
-        rows: [
-          anomalyRow("Hong Kong"),
-          anomalyRow("Shenzhen", {
-            rank: 2,
-            country: "CN",
-            z_score: 4.62,
-            humidity_pct: 64,
-            normal_humidity_pct: 86.2,
-          }),
-        ],
-      }),
-    });
+  it("is not on Home — the board lives on its own page now", async () => {
+    mockApi({ tracked, weather: weatherPage, anomalies: anomalyBoard() });
 
     renderApp();
+    await screen.findByRole("heading", { name: "London" });
 
-    const board = await screen.findByRole("region", { name: /most anomalous cities/i });
-    expect(within(board).getByText("Hong Kong")).toBeInTheDocument();
-    expect(within(board).getByText("Shenzhen")).toBeInTheDocument();
-
-    // The observation and the normal are both present, so a reader can check
-    // the ranking rather than take it on trust.
-    expect(within(board).getByText(/humidity 62% · normal 88%/)).toBeInTheDocument();
-    expect(within(board).getByText(/6\.0σ below/)).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /most anomalous/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("Hong Kong")).not.toBeInTheDocument();
   });
 
-  it("renders the ranked board when no briefing is available", async () => {
-    /* The acceptance property, at the UI level: the LLM layer is commentary. */
-    mockApi({
-      tracked,
-      weather: weatherPage,
-      anomalies: anomalyBoard({ briefing: null }),
-    });
+  it("is reachable from Home by the nav link", async () => {
+    mockApi({ tracked, weather: weatherPage, anomalies: anomalyBoard() });
 
+    const user = userEvent.setup();
     renderApp();
+    await screen.findByRole("heading", { name: "London" });
 
-    const board = await screen.findByRole("region", { name: /most anomalous cities/i });
-    expect(within(board).getByText("Hong Kong")).toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: "Anomalies" }));
+
+    expect(await screen.findByRole("heading", { name: /global anomalies/i })).toBeInTheDocument();
+  });
+
+  it("ranks each variable on its own board", async () => {
+    /* The reason the boards were split: temperature is visible even on a day
+       when humidity has the larger departures. */
+    mockApi({ tracked, weather: weatherPage, anomalies: anomalyBoard() });
+
+    renderApp(<App />, "/anomalies");
+
+    const temperature = await screen.findByRole("region", { name: /most anomalous — temperature/i });
+    const humidity = screen.getByRole("region", { name: /most anomalous — humidity/i });
+
+    expect(within(temperature).getByText("Johannesburg")).toBeInTheDocument();
+    expect(within(temperature).getByText(/1\.4°C · normal 13\.4°C/)).toBeInTheDocument();
+    expect(within(temperature).getByText(/3\.8σ below/)).toBeInTheDocument();
+
+    expect(within(humidity).getByText("Hong Kong")).toBeInTheDocument();
+    expect(within(humidity).getByText(/62% · normal 88%/)).toBeInTheDocument();
+  });
+
+  it("renders both boards when no briefing is available", async () => {
+    /* The acceptance property at the UI level: the LLM layer is commentary. */
+    mockApi({ tracked, weather: weatherPage, anomalies: anomalyBoard({ briefing: null }) });
+
+    renderApp(<App />, "/anomalies");
+
+    expect(
+      await screen.findByRole("region", { name: /most anomalous — temperature/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: /most anomalous — humidity/i })).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: /briefing/i })).not.toBeInTheDocument();
   });
 
@@ -352,7 +371,7 @@ describe("Global anomaly board", () => {
       }),
     });
 
-    renderApp();
+    renderApp(<App />, "/anomalies");
 
     expect(
       await screen.findByRole("heading", { name: /dry intrusion over the Pearl River Delta/i }),
@@ -361,23 +380,20 @@ describe("Global anomaly board", () => {
     // Health risks are surfaced; routine notes are not worth the space.
     expect(screen.getByText(/Wildfire risk elevated/)).toBeInTheDocument();
     expect(screen.queryByText(/Unremarkable in absolute terms/)).not.toBeInTheDocument();
-    expect(screen.getByText(/Foshan/)).toBeInTheDocument();
   });
 
-  it("hides the board before the first sweep instead of showing an empty section", async () => {
+  it("explains itself before the first sweep instead of showing empty boards", async () => {
     mockApi({ tracked, weather: weatherPage });
 
-    renderApp();
-    await screen.findByRole("heading", { name: "London" });
+    renderApp(<App />, "/anomalies");
 
-    expect(
-      screen.queryByRole("region", { name: /most anomalous cities/i }),
-    ).not.toBeInTheDocument();
+    expect(await screen.findByText(/No sweep has completed yet/)).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /most anomalous/i })).not.toBeInTheDocument();
   });
 
-  it("keeps the dashboard intact when the anomaly board fails", async () => {
+  it("keeps Home working when the anomaly board fails", async () => {
     /* A failing global board must never reach the error chain that replaces
-       the whole grid with an ErrorState. */
+       Home's grid with an ErrorState. */
     mockApi({
       tracked,
       weather: weatherPage,
@@ -387,10 +403,20 @@ describe("Global anomaly board", () => {
     renderApp();
 
     expect(await screen.findByRole("heading", { name: "London" })).toBeInTheDocument();
-    await waitFor(() =>
-      expect(screen.queryByRole("region", { name: /most anomalous cities/i })).not.toBeInTheDocument(),
-    );
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
     expect(screen.queryByText(/Board unavailable/)).not.toBeInTheDocument();
+  });
+
+  it("says so on its own page when the board fails", async () => {
+    mockApi({
+      tracked,
+      weather: weatherPage,
+      anomalies: { status: 503, body: { detail: "Board unavailable" } },
+    });
+
+    renderApp(<App />, "/anomalies");
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(/anomaly board is unavailable/i)).toBeInTheDocument();
   });
 });

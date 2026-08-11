@@ -6,6 +6,7 @@ import "@fontsource/ibm-plex-mono/600.css";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
 import App from "./App";
 import "./index.css";
 
@@ -25,7 +26,10 @@ if (!container) throw new Error("Root element #root is missing from index.html")
 createRoot(container).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      {/* Router lives here rather than in App so tests can supply their own. */}
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,
 );

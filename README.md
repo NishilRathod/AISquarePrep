@@ -16,7 +16,7 @@ are throttled with an async token bucket and retried with backoff on
 | GET    | `/cities`        | Tracked cities, oldest-added first, plus the env-configured `defaults`. |
 | POST   | `/cities`        | Track a new city. `201` when added, `200` when already tracked.       |
 | GET    | `/cities/search` | Autocomplete over a vendored GeoNames index. `q` (min 2 chars), `limit`. |
-| GET    | `/anomalies`     | The most anomalous cities on Earth right now, ranked. `limit` (1–50, default 10). |
+| GET    | `/anomalies`     | Two rankings of the most anomalous cities on Earth right now — one per variable. `limit` (1–50, default 10) applies to each. |
 | POST   | `/anomalies/refresh` | Force a sweep now instead of waiting for the timer.              |
 
 Cities added through `POST /cities` persist in Redis (`tracked:cities`) and are
@@ -36,13 +36,22 @@ z = (observed - mean) / stddev
 Dividing by each city's own sigma is what makes the ranking meaningful across
 climates. Eight degrees above normal is the same departure in Reykjavík and
 Delhi but nowhere near the same event; the measured normals bear that out —
-Moscow's January sigma is 8.1 °C against Lagos's 0.6 °C. A row is ranked on
-`max(|z_temperature|, |z_humidity|)` rather than their average, because
-averaging would let a perfectly normal humidity halve a genuine temperature
-extreme.
+Moscow's January sigma is 8.1 °C against Lagos's 0.6 °C.
 
-Every row carries the observation, the normal, and the standard deviation, so
-the ranking can be recomputed from the response rather than taken on trust.
+The response carries **two independent rankings**, `temperature` and `humidity`.
+They are separate because a single combined ranking lets whichever variable is
+having a dramatic day own the entire visible top ten — observed in practice,
+where one regional dry intrusion filled all ten rows and made it look as though
+temperature were not considered. Ranking each variable on its own keeps both
+visible. A city can appear on both boards; when it does, that is one event.
+
+The variables need no rebalancing to be compared this way: measured median sigma
+is 2.37 °C against 9.61 humidity points, so a 4 °C swing and a 15-point swing
+both score about 1.7σ.
+
+Every row carries the observation, the normal, the standard deviation, and *both*
+z-scores, so either ranking can be recomputed from the response rather than taken
+on trust.
 
 Three things are worth knowing about how it runs:
 
@@ -52,8 +61,14 @@ Three things are worth knowing about how it runs:
   returns `200` with `rows: []` and `source: "unavailable"` rather than an
   error — use `POST /anomalies/refresh` to populate it immediately.
 - **Coverage is whatever the normals artefact holds.** Cities without a
-  baseline are absent from the board rather than wrong on it, so the artefact
-  can be widened toward the full 33,957-city index without a code change.
+  baseline are absent from the board rather than wrong on it, and the sweep only
+  requests cities it can actually score, so the artefact can be widened toward
+  the full 33,957-city index without a code change. Build it with
+  `python scripts/build_climate_normals.py` (defaults to the ~6,200 cities over
+  100,000 people; `--min-population 0` for the whole index). The run is
+  rate-limited, self-pacing and resumable — see the script's docstring, which
+  also records why deduplicating nearby cities onto a grid was tried and
+  rejected.
 - **The briefing is optional.** `briefing` is `null` whenever no Anthropic key
   is configured or the call fails. The rows are unaffected.
 
@@ -77,10 +92,18 @@ A React + TypeScript dashboard lives in [`frontend/`](frontend/). It lists the
 tracked cities, badges each reading `CACHED` or `LIVE` depending on whether it
 came from Redis or OpenWeather, and lets you search for and track new cities.
 
-Below the grid it shows the global anomaly board. That section is independent of
-the tracked cities and of each other's failures: if `/anomalies` errors or has
-never swept, the section is simply absent and the dashboard is unaffected. The
-briefing above the rankings appears only when one is available.
+It has two pages:
+
+| Route | Page | Content |
+|---|---|---|
+| `/` | **Home** | Tracked cities, search, pagination, pinning |
+| `/anomalies` | **Anomalies** | The two global rankings, plus the briefing when one is available |
+
+The pages are independent by design, including in failure. The anomaly board is
+global data with no relationship to the tracked cities, so a failing `/anomalies`
+leaves Home completely unaffected — there is a test asserting exactly that,
+because the obvious implementation (folding it into the shared error state) would
+blank someone's own cities over an unrelated outage.
 
 ```bash
 cd frontend
