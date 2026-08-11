@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addCity,
   ApiError,
+  fetchAnomalies,
   fetchHealth,
   fetchTrackedCities,
   fetchWeather,
@@ -15,6 +16,7 @@ export const queryKeys = {
   weather: (cities: string[]) => ["weather", cities] as const,
   search: (query: string) => ["cities", "search", query] as const,
   health: ["health"] as const,
+  anomalies: (limit: number) => ["anomalies", limit] as const,
 };
 
 export function useTrackedCities() {
@@ -51,6 +53,25 @@ export function useHealth() {
     // A 503 here is the answer, not a fluke worth retrying.
     retry: false,
     refetchInterval: 60_000,
+  });
+}
+
+/**
+ * The global anomaly board.
+ *
+ * Deliberately isolated from the dashboard's error handling: this query's
+ * failure must never reach the `error` branch in App, which replaces the whole
+ * grid with an ErrorState. A board that cannot load is a missing section, not a
+ * broken dashboard. The server sweeps on a multi-hour timer, so polling harder
+ * than that would only re-fetch an identical board.
+ */
+export function useAnomalies(limit = 10) {
+  return useQuery({
+    queryKey: queryKeys.anomalies(limit),
+    queryFn: () => fetchAnomalies(limit),
+    staleTime: 15 * 60_000,
+    refetchInterval: 15 * 60_000,
+    retry: false,
   });
 }
 

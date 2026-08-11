@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { API_BASE_URL } from "./api/client";
 import type { Weather } from "./api/types";
+import { AnomalyBoard } from "./components/AnomalyBoard";
 import { Button } from "./components/Button";
 import { CitySearchBar } from "./components/CitySearchBar";
 import { ErrorState } from "./components/ErrorState";
@@ -8,7 +9,7 @@ import { HealthPill } from "./components/HealthPill";
 import { Pagination } from "./components/Pagination";
 import { SkeletonGrid } from "./components/SkeletonGrid";
 import { MissingCityCard, WeatherCard } from "./components/WeatherCard";
-import { useTrackedCities, useWeather } from "./hooks/queries";
+import { useAnomalies, useTrackedCities, useWeather } from "./hooks/queries";
 import { normalizeCity } from "./lib/format";
 import {
   MAX_PINS,
@@ -140,7 +141,16 @@ export default function App() {
 
   const isInitialLoad = trackedQuery.isPending || (weatherQuery.isPending && pageCities.length > 0);
   const isRefreshing = trackedQuery.isFetching || weatherQuery.isFetching;
+  // Deliberately excludes anomalyQuery: this chain swaps the whole grid for an
+  // ErrorState, and a global board that failed to load must not take the user's
+  // own cities down with it.
   const error = trackedQuery.error ?? weatherQuery.error;
+
+  const anomalyQuery = useAnomalies();
+  const board = anomalyQuery.data;
+  // Before the first server-side sweep the board is legitimately empty; there
+  // is nothing to show and nothing wrong.
+  const showBoard = Boolean(board && board.rows.length > 0);
 
   const refresh = () => {
     void trackedQuery.refetch();
@@ -223,6 +233,15 @@ export default function App() {
             </>
           )}
         </main>
+
+        {showBoard && board && (
+          <AnomalyBoard
+            rows={board.rows}
+            citiesScored={board.cities_scored}
+            sweptAt={board.swept_at}
+            briefing={board.briefing}
+          />
+        )}
 
         <footer
           className="mt-6 border-t pt-3 text-[11px] leading-relaxed"

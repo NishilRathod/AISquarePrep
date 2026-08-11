@@ -16,16 +16,71 @@ are throttled with an async token bucket and retried with backoff on
 | GET    | `/cities`        | Tracked cities, oldest-added first, plus the env-configured `defaults`. |
 | POST   | `/cities`        | Track a new city. `201` when added, `200` when already tracked.       |
 | GET    | `/cities/search` | Autocomplete over a vendored GeoNames index. `q` (min 2 chars), `limit`. |
+| GET    | `/anomalies`     | The most anomalous cities on Earth right now, ranked. `limit` (1–50, default 10). |
+| POST   | `/anomalies/refresh` | Force a sweep now instead of waiting for the timer.              |
 
 Cities added through `POST /cities` persist in Redis (`tracked:cities`) and are
 appended after the `TRACKED_CITIES` defaults, so `GET /weather` picks them up
 without a restart.
+
+## Global anomaly board
+
+`GET /anomalies` ranks cities by **standardized anomaly** — how many standard
+deviations today's local daily mean sits from that city's own normal for this
+calendar month:
+
+```
+z = (observed - mean) / stddev
+```
+
+Dividing by each city's own sigma is what makes the ranking meaningful across
+climates. Eight degrees above normal is the same departure in Reykjavík and
+Delhi but nowhere near the same event; the measured normals bear that out —
+Moscow's January sigma is 8.1 °C against Lagos's 0.6 °C. A row is ranked on
+`max(|z_temperature|, |z_humidity|)` rather than their average, because
+averaging would let a perfectly normal humidity halve a genuine temperature
+extreme.
+
+Every row carries the observation, the normal, and the standard deviation, so
+the ranking can be recomputed from the response rather than taken on trust.
+
+Three things are worth knowing about how it runs:
+
+- **It is scheduled, not per-request.** A background sweep scores every covered
+  city every `ANOMALY_SWEEP_INTERVAL_SECONDS` and stores the board in Redis;
+  reads never touch an upstream API. Before the first sweep, `GET /anomalies`
+  returns `200` with `rows: []` and `source: "unavailable"` rather than an
+  error — use `POST /anomalies/refresh` to populate it immediately.
+- **Coverage is whatever the normals artefact holds.** Cities without a
+  baseline are absent from the board rather than wrong on it, so the artefact
+  can be widened toward the full 33,957-city index without a code change.
+- **The briefing is optional.** `briefing` is `null` whenever no Anthropic key
+  is configured or the call fails. The rows are unaffected.
+
+### The LLM step
+
+`briefing` is the one place a model is involved, and it never touches the
+ranking. Detection is arithmetic, ranking is a sort, and the top-N is a slice —
+a model doing any of that would be slower, costlier, and occasionally wrong.
+
+It is asked for what arithmetic cannot supply: that five Pearl River Delta
+cities in the top ten are one dry intrusion rather than five independent facts;
+that a large departure in a mild absolute range is not a health story while a
+smaller one in a dense humid city is; and that a reading which passes the
+plausibility filter may still be a broken station. It sees the top 15 rows once
+per sweep, returns structured output, and is cached against a digest of the rows
+themselves.
 
 ## Web UI
 
 A React + TypeScript dashboard lives in [`frontend/`](frontend/). It lists the
 tracked cities, badges each reading `CACHED` or `LIVE` depending on whether it
 came from Redis or OpenWeather, and lets you search for and track new cities.
+
+Below the grid it shows the global anomaly board. That section is independent of
+the tracked cities and of each other's failures: if `/anomalies` errors or has
+never swept, the section is simply absent and the dashboard is unaffected. The
+briefing above the rankings appears only when one is available.
 
 ```bash
 cd frontend
@@ -69,6 +124,17 @@ cp .env.example .env
 | `CACHE_TTL_SECONDS`                  | `600`                                              | How long a city's weather stays cached.        |
 | `TRACKED_CITIES`                     | `London,Paris,New York,Tokyo,Sydney,Davangere`     | Seed city list; runtime additions are appended. |
 | `DEFAULT_PAGE_SIZE` / `MAX_PAGE_SIZE`| `10` / `50`                                        | Pagination defaults/limits.                    |
+| `OPEN_METEO_BASE_URL`                | `https://api.open-meteo.com/v1`                    | Bulk provider for the anomaly sweep. No API key — the free tier is keyless. |
+| `OPEN_METEO_TIMEOUT_SECONDS`         | `60.0`                                             | Per-batch timeout (a batch covers many cities). |
+| `OPEN_METEO_MAX_RETRIES`             | `2`                                                | Retries per batch on 429/5xx.                  |
+| `OPEN_METEO_BACKOFF_BASE_SECONDS`    | `2.0`                                              | Backoff base when `Retry-After` is absent.     |
+| `ANOMALY_SWEEP_ENABLED`              | `true`                                             | Set `false` to disable the background sweep entirely. |
+| `ANOMALY_SWEEP_INTERVAL_SECONDS`     | `10800`                                            | Three-hourly. The first sweep runs after one interval, not at startup. |
+| `ANOMALY_SWEEP_BATCH_SIZE`           | `200`                                              | Coordinates per upstream request.              |
+| `ANOMALY_BOARD_SIZE` / `ANOMALY_DEFAULT_LIMIT` | `50` / `10`                              | Rows stored per sweep / rows served by default. |
+| `ANTHROPIC_API_KEY`                  | *(optional)*                                       | Enables the anomaly briefing. Without it the board still ranks; `briefing` is `null`. |
+| `ANTHROPIC_MODEL`                    | `claude-opus-5`                                    | Model used for the briefing.                   |
+| `ANOMALY_BRIEFING_CACHE_TTL_SECONDS` | `21600`                                            | How long a briefing is reused for an unchanged board. |
 
 ## Run with Docker Compose
 

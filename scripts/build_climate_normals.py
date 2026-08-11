@@ -152,8 +152,13 @@ def _fetch_batch(
         try:
             payload = _fetch(url, timeout=timeout)
         except RateLimited:
+            # Skip the batch rather than raise. This job runs for hours, and
+            # letting one exhausted batch abort it would throw away every city
+            # fetched since the last restart -- the opposite of resumable. The
+            # cities land in a later run instead.
             if attempt == 5:
-                raise
+                print("    still rate limited after backoff; batch deferred", flush=True)
+                return None
             print(f"    rate limited, sleeping {delay:.0f}s", flush=True)
             time.sleep(delay)
             delay = min(delay * 1.5, 600.0)

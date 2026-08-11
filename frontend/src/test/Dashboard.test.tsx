@@ -4,7 +4,48 @@ import userEvent from "@testing-library/user-event";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
-import type { CitySuggestion, PaginatedWeather, TrackedCities, Weather } from "../api/types";
+import type {
+  AnomalyBoard,
+  AnomalyRow,
+  CitySuggestion,
+  PaginatedWeather,
+  TrackedCities,
+  Weather,
+} from "../api/types";
+
+function anomalyRow(city: string, overrides: Partial<AnomalyRow> = {}): AnomalyRow {
+  return {
+    rank: 1,
+    city,
+    state: "",
+    country: "HK",
+    latitude: 22.28,
+    longitude: 114.15,
+    temperature_c: 27.0,
+    humidity_pct: 62,
+    normal_temperature_c: 28.4,
+    normal_humidity_pct: 87.6,
+    sd_temperature_c: 1.1,
+    sd_humidity_pct: 4.3,
+    z_temperature: -1.27,
+    z_humidity: -5.95,
+    z_score: 5.95,
+    driver: "humidity",
+    direction: "below",
+    ...overrides,
+  };
+}
+
+function anomalyBoard(overrides: Partial<AnomalyBoard> = {}): AnomalyBoard {
+  return {
+    rows: [anomalyRow("Hong Kong")],
+    briefing: null,
+    swept_at: new Date().toISOString(),
+    cities_scored: 2000,
+    source: "fresh",
+    ...overrides,
+  };
+}
 
 function weather(city: string, overrides: Partial<Weather> = {}): Weather {
   return {
@@ -33,6 +74,7 @@ interface RouteConfig {
   tracked?: TrackedCities;
   weather?: PaginatedWeather | { status: number; body: unknown };
   search?: CitySuggestion[];
+  anomalies?: AnomalyBoard | { status: number; body: unknown };
 }
 
 /**
@@ -74,6 +116,24 @@ function mockApi(config: RouteConfig) {
         return jsonResponse(configured.body, configured.status);
       }
       return jsonResponse(configured ?? { items: [], page: 1, page_size: 10, total: 0 });
+    }
+
+    if (url.includes("/anomalies")) {
+      const configured = config.anomalies;
+      if (configured && "status" in configured) {
+        return jsonResponse(configured.body, configured.status);
+      }
+      // Default to the cold-start shape: a board exists but has not swept yet.
+      return jsonResponse(
+        configured ??
+          ({
+            rows: [],
+            briefing: null,
+            swept_at: null,
+            cities_scored: 0,
+            source: "unavailable",
+          } satisfies AnomalyBoard),
+      );
     }
 
     throw new Error(`Unexpected request: ${url}`);
@@ -212,5 +272,125 @@ describe("Weather dashboard", () => {
 
     await waitFor(() => expect(postedCities).toEqual(["Berlin"]));
     expect(await screen.findByRole("heading", { name: "Berlin" })).toBeInTheDocument();
+  });
+});
+
+describe("Global anomaly board", () => {
+  const tracked = { cities: ["London"], defaults: ["London"] };
+  const weatherPage = {
+    items: [weather("London")],
+    page: 1,
+    page_size: 10,
+    total: 1,
+  };
+
+  it("ranks cities and shows the numbers the ranking is derived from", async () => {
+    mockApi({
+      tracked,
+      weather: weatherPage,
+      anomalies: anomalyBoard({
+        rows: [
+          anomalyRow("Hong Kong"),
+          anomalyRow("Shenzhen", {
+            rank: 2,
+            country: "CN",
+            z_score: 4.62,
+            humidity_pct: 64,
+            normal_humidity_pct: 86.2,
+          }),
+        ],
+      }),
+    });
+
+    renderApp();
+
+    const board = await screen.findByRole("region", { name: /most anomalous cities/i });
+    expect(within(board).getByText("Hong Kong")).toBeInTheDocument();
+    expect(within(board).getByText("Shenzhen")).toBeInTheDocument();
+
+    // The observation and the normal are both present, so a reader can check
+    // the ranking rather than take it on trust.
+    expect(within(board).getByText(/humidity 62% · normal 88%/)).toBeInTheDocument();
+    expect(within(board).getByText(/6\.0σ below/)).toBeInTheDocument();
+  });
+
+  it("renders the ranked board when no briefing is available", async () => {
+    /* The acceptance property, at the UI level: the LLM layer is commentary. */
+    mockApi({
+      tracked,
+      weather: weatherPage,
+      anomalies: anomalyBoard({ briefing: null }),
+    });
+
+    renderApp();
+
+    const board = await screen.findByRole("region", { name: /most anomalous cities/i });
+    expect(within(board).getByText("Hong Kong")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /briefing/i })).not.toBeInTheDocument();
+  });
+
+  it("shows the briefing's grouped events when one is available", async () => {
+    mockApi({
+      tracked,
+      weather: weatherPage,
+      anomalies: anomalyBoard({
+        briefing: {
+          headline: "A dry intrusion over the Pearl River Delta",
+          events: [
+            {
+              name: "Pearl River Delta dry intrusion",
+              cities: ["Hong Kong", "Shenzhen"],
+              explanation: "One continental air mass, not two separate events.",
+            },
+          ],
+          notes: [
+            { city: "Hong Kong", significance: "health_risk", note: "Wildfire risk elevated." },
+            { city: "Shenzhen", significance: "routine", note: "Unremarkable in absolute terms." },
+          ],
+          suspect_readings: ["Foshan"],
+        },
+      }),
+    });
+
+    renderApp();
+
+    expect(
+      await screen.findByRole("heading", { name: /dry intrusion over the Pearl River Delta/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/One continental air mass/)).toBeInTheDocument();
+    // Health risks are surfaced; routine notes are not worth the space.
+    expect(screen.getByText(/Wildfire risk elevated/)).toBeInTheDocument();
+    expect(screen.queryByText(/Unremarkable in absolute terms/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Foshan/)).toBeInTheDocument();
+  });
+
+  it("hides the board before the first sweep instead of showing an empty section", async () => {
+    mockApi({ tracked, weather: weatherPage });
+
+    renderApp();
+    await screen.findByRole("heading", { name: "London" });
+
+    expect(
+      screen.queryByRole("region", { name: /most anomalous cities/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the dashboard intact when the anomaly board fails", async () => {
+    /* A failing global board must never reach the error chain that replaces
+       the whole grid with an ErrorState. */
+    mockApi({
+      tracked,
+      weather: weatherPage,
+      anomalies: { status: 503, body: { detail: "Board unavailable" } },
+    });
+
+    renderApp();
+
+    expect(await screen.findByRole("heading", { name: "London" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("region", { name: /most anomalous cities/i })).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Board unavailable/)).not.toBeInTheDocument();
   });
 });

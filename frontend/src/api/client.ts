@@ -1,5 +1,6 @@
 import type {
   AddCityResult,
+  AnomalyBoard,
   CitySuggestion,
   Health,
   PaginatedWeather,
@@ -119,4 +120,12 @@ export function addCity(city: string): Promise<AddCityResult> {
 
 export function fetchHealth(): Promise<Health> {
   return request<Health>("/health");
+}
+
+/**
+ * The global anomaly board. Unrelated to the tracked cities — it ranks every
+ * city the climate-normals artefact covers, so it takes no city list.
+ */
+export function fetchAnomalies(limit = 10): Promise<AnomalyBoard> {
+  return request<AnomalyBoard>(`/anomalies?limit=${limit}`);
 }

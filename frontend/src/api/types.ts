@@ -41,3 +41,59 @@ export interface Health {
   status: "ok" | "error";
   redis: "connected" | "unreachable";
 }
+
+export type AnomalyDriver = "temperature" | "humidity";
+export type AnomalyDirection = "above" | "below";
+
+/**
+ * One city on the global anomaly board. Carries the normal and the standard
+ * deviation alongside the observation so a reader can recompute `z_score`
+ * from the row itself rather than taking the ranking on trust.
+ */
+export interface AnomalyRow {
+  rank: number;
+  city: string;
+  state: string;
+  country: string;
+  latitude: number;
+  longitude: number;
+  temperature_c: number;
+  humidity_pct: number;
+  normal_temperature_c: number;
+  normal_humidity_pct: number;
+  sd_temperature_c: number;
+  sd_humidity_pct: number;
+  z_temperature: number;
+  z_humidity: number;
+  z_score: number;
+  driver: AnomalyDriver;
+  direction: AnomalyDirection;
+}
+
+export interface SynopticEvent {
+  name: string;
+  cities: string[];
+  explanation: string;
+}
+
+export interface CityNote {
+  city: string;
+  significance: "notable" | "routine" | "health_risk";
+  note: string;
+}
+
+export interface AnomalyBriefing {
+  headline: string;
+  events: SynopticEvent[];
+  notes: CityNote[];
+  suspect_readings: string[];
+}
+
+export interface AnomalyBoard {
+  rows: AnomalyRow[];
+  /** Null whenever the interpretation layer is unavailable. The rows stand alone. */
+  briefing: AnomalyBriefing | null;
+  swept_at: string | null;
+  cities_scored: number;
+  source: "fresh" | "stale" | "unavailable";
+}
