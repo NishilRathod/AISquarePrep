@@ -184,3 +184,57 @@ def test_normals_reject_out_of_range_months(month, tmp_path):
 
     store = NormalsStore.from_values(array("f", [0.0] * 48), 1)
     assert store.get(0, month) is None
+
+
+class TestUrlSplitting:
+    """The archive server rejects URIs over 8 KB, and a 414 costs the whole batch."""
+
+    def _script(self):
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent.parent / "scripts" / "build_climate_normals.py"
+        spec = importlib.util.spec_from_file_location("build_climate_normals", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _cities(self, n, lat=-123.4567, lon=-123.4567):
+        return [
+            CityRecord(
+                row_index=i,
+                geonameid=i,
+                name=f"C{i}",
+                state="",
+                country="XX",
+                population=1,
+                latitude=lat,
+                longitude=lon,
+            )
+            for i in range(n)
+        ]
+
+    def test_oversized_batches_are_split_until_they_fit(self):
+        script = self._script()
+        chunks = script.split_to_url_limit(self._cities(500), "2021-01-01", "2025-12-31")
+
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert len(script._batch_url(chunk, "2021-01-01", "2025-12-31")) <= script.MAX_URL_CHARS
+
+    def test_every_city_survives_the_split(self):
+        """Splitting must not drop or duplicate anyone."""
+        script = self._script()
+        cities = self._cities(500)
+        chunks = script.split_to_url_limit(cities, "2021-01-01", "2025-12-31")
+
+        flattened = [city for chunk in chunks for city in chunk]
+        assert [c.geonameid for c in flattened] == [c.geonameid for c in cities]
+
+    def test_a_batch_that_already_fits_is_left_alone(self):
+        script = self._script()
+        cities = self._cities(20)
+        assert script.split_to_url_limit(cities, "2021-01-01", "2025-12-31") == [cities]
+
+    def test_empty_batch(self):
+        assert self._script().split_to_url_limit([], "2021-01-01", "2025-12-31") == []

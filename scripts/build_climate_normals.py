@@ -99,6 +99,12 @@ MONTHS = 12
 # Per city-month we store: mean temp, sd temp, mean humidity, sd humidity.
 STATS = 4
 
+# Coordinates go in the query string, and the server rejects a URI over 8 KB with
+# a 414 -- measured: 500 cities is 8,291 characters and fails, 250 is 4,219 and
+# does not. Splitting below this is far better than discovering it as a dropped
+# batch, since a 414 costs the whole batch and looks like any other failure.
+MAX_URL_CHARS = 7_000
+
 # Sentinel written for a city-month with too little data to characterise. NaN
 # rather than 0.0 so a missing baseline can never masquerade as a real one --
 # scoring skips these instead of reporting a spurious anomaly.
@@ -133,17 +139,7 @@ def _fetch(url: str, *, timeout: float) -> object:
         raise
 
 
-def _fetch_batch(
-    batch: list[CityRecord], start: str, end: str, *, timeout: float
-) -> tuple[list[dict] | None, bool]:
-    """One archive request covering every city in ``batch``.
-
-    Returns ``(results, throttled)``. ``results`` is ``None`` for a non-retryable
-    failure, in which case the caller drops the batch rather than aborting the
-    run -- a handful of missing cities is a far better outcome than losing hours
-    of accumulated progress. ``throttled`` tells the pacer it overshot, whether
-    or not the batch eventually succeeded.
-    """
+def _batch_url(batch: list[CityRecord], start: str, end: str) -> str:
     query = urllib.parse.urlencode(
         {
             "latitude": ",".join(str(city.latitude) for city in batch),
@@ -156,7 +152,41 @@ def _fetch_batch(
             "timezone": "auto",
         }
     )
-    url = f"{ARCHIVE_URL}?{query}"
+    return f"{ARCHIVE_URL}?{query}"
+
+
+def split_to_url_limit(
+    batch: list[CityRecord], start: str, end: str
+) -> list[list[CityRecord]]:
+    """Break a batch into chunks whose URLs the server will accept.
+
+    Coordinate strings vary in length -- a negative three-digit longitude is
+    nearly twice a short positive one -- so a fixed city count is not a safe
+    proxy for URL size. Measure the real URL and halve until it fits.
+    """
+    if not batch:
+        return []
+    if len(_batch_url(batch, start, end)) <= MAX_URL_CHARS or len(batch) == 1:
+        return [batch]
+
+    midpoint = len(batch) // 2
+    return split_to_url_limit(batch[:midpoint], start, end) + split_to_url_limit(
+        batch[midpoint:], start, end
+    )
+
+
+def _fetch_batch(
+    batch: list[CityRecord], start: str, end: str, *, timeout: float
+) -> tuple[list[dict] | None, bool]:
+    """One archive request covering every city in ``batch``.
+
+    Returns ``(results, throttled)``. ``results`` is ``None`` for a non-retryable
+    failure, in which case the caller drops the batch rather than aborting the
+    run -- a handful of missing cities is a far better outcome than losing hours
+    of accumulated progress. ``throttled`` tells the pacer it overshot, whether
+    or not the batch eventually succeeded.
+    """
+    url = _batch_url(batch, start, end)
 
     delay = 60.0
     throttled = False
@@ -350,8 +380,12 @@ def build(
 
     started = time.time()
     with checkpoint_path.open("a", encoding="utf-8") as checkpoint:
+        chunks: list[list[CityRecord]] = []
         for offset in range(0, len(pending), batch_size):
-            batch = pending[offset : offset + batch_size]
+            chunks.extend(split_to_url_limit(pending[offset : offset + batch_size], start, end))
+
+        done_count = 0
+        for chunk_index, batch in enumerate(chunks):
             batch_started = time.time()
             results, throttled = _fetch_batch(batch, start, end, timeout=timeout)
 
@@ -382,7 +416,8 @@ def build(
                 done[city.geonameid] = values
             checkpoint.flush()
 
-            complete = offset + len(batch)
+            done_count += len(batch)
+            complete = done_count
             elapsed = time.time() - started
             observed = complete / elapsed if elapsed else 0
             eta = (len(pending) - complete) / observed / 60 if observed else 0
@@ -393,7 +428,7 @@ def build(
                 flush=True,
             )
 
-            if offset + batch_size < len(pending):
+            if chunk_index + 1 < len(chunks):
                 remaining = pacer.seconds_between(len(batch) * years) - (
                     time.time() - batch_started
                 )
@@ -486,7 +521,15 @@ def main() -> None:
         ),
     )
     parser.add_argument("--years", type=int, default=10, help="years of history (default: 10)")
-    parser.add_argument("--batch", type=int, default=40, help="cities per request (default: 40)")
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=200,
+        help=(
+            "cities per request (default: 200). Automatically split further if the "
+            "URL would exceed the server's 8 KB limit."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=180.0, help="per-request timeout seconds")
     parser.add_argument(
         "--rate",
