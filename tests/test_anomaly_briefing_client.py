@@ -48,11 +48,20 @@ BRIEFING = AnomalyBriefing(
 )
 
 
+class StubUsage:
+    input_tokens = 4471
+    output_tokens = 806
+
+
+USAGE = StubUsage()
+
+
 class StubMessages:
-    def __init__(self, result=None, error=None, stop_reason="end_turn"):
+    def __init__(self, result=None, error=None, stop_reason="end_turn", usage=USAGE):
         self.result = result
         self.error = error
         self.stop_reason = stop_reason
+        self.usage = usage
         self.kwargs = None
 
     async def parse(self, **kwargs):
@@ -66,6 +75,11 @@ class StubMessages:
         response = Response()
         response.parsed_output = self.result
         response.stop_reason = self.stop_reason
+        response.model = "claude-opus-5"
+        # Omitted entirely when the stub is built without one, which is how the
+        # tracing code's tolerance for a thin response gets exercised.
+        if self.usage is not None:
+            response.usage = self.usage
         return response
 
 

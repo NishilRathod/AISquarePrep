@@ -19,6 +19,7 @@ from app.models.anomaly import AnomalyBoard, AnomalyBriefing, AnomalyRow
 from app.services.anomaly import Observation, rank_by, score_city
 from app.services.city_index import CityRecord, city_records
 from app.services.normals import NormalsStore, NormalsUnavailableError, load_normals
+from app.telemetry import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -63,52 +64,63 @@ class AnomalyBoardService:
 
     async def sweep(self) -> AnomalyBoard:
         """Fetch current conditions for every covered city, score, rank, store."""
-        try:
-            normals = load_normals()
-        except NormalsUnavailableError as exc:
-            logger.warning("Anomaly sweep skipped: %s", exc)
-            return _empty_board()
+        with tracer.start_as_current_span("anomaly.sweep") as span:
+            try:
+                with tracer.start_as_current_span("anomaly.load_normals"):
+                    normals = load_normals()
+            except NormalsUnavailableError as exc:
+                span.set_attribute("sweep.skipped", True)
+                logger.warning("Anomaly sweep skipped: %s", exc)
+                return _empty_board()
 
-        # Only cities with a baseline. Fetching the rest would be a request per
-        # city whose reading is then discarded for having nothing to compare to.
-        all_cities = city_records()
-        cities = [
-            all_cities[row_index]
-            for row_index in normals.covered_row_indices
-            if row_index < len(all_cities)
-        ]
-        logger.info(
-            "Anomaly sweep starting over %d cities with a baseline (of %d in the index)",
-            len(cities),
-            len(all_cities),
-        )
+            # Only cities with a baseline. Fetching the rest would be a request per
+            # city whose reading is then discarded for having nothing to compare to.
+            all_cities = city_records()
+            cities = [
+                all_cities[row_index]
+                for row_index in normals.covered_row_indices
+                if row_index < len(all_cities)
+            ]
+            span.set_attribute("cities.covered", len(cities))
+            span.set_attribute("cities.in_index", len(all_cities))
+            logger.info(
+                "Anomaly sweep starting over %d cities with a baseline (of %d in the index)",
+                len(cities),
+                len(all_cities),
+            )
 
-        readings = await self._client.fetch_current_bulk(
-            [(city.latitude, city.longitude) for city in cities]
-        )
+            readings = await self._client.fetch_current_bulk(
+                [(city.latitude, city.longitude) for city in cities]
+            )
 
-        scored = self._score_all(cities, readings, normals)
-        temperature = rank_by(scored, "temperature", self._board_size)
-        humidity = rank_by(scored, "humidity", self._board_size)
-        logger.info(
-            "Anomaly sweep scored %d cities, kept %d temperature and %d humidity rows",
-            len(scored),
-            len(temperature),
-            len(humidity),
-        )
+            with tracer.start_as_current_span("anomaly.score") as score_span:
+                scored = self._score_all(cities, readings, normals)
+                temperature = rank_by(scored, "temperature", self._board_size)
+                humidity = rank_by(scored, "humidity", self._board_size)
+                score_span.set_attribute("cities.scored", len(scored))
 
-        briefing = await self._brief(temperature, humidity)
+            span.set_attribute("cities.scored", len(scored))
+            span.set_attribute("board.temperature_rows", len(temperature))
+            span.set_attribute("board.humidity_rows", len(humidity))
+            logger.info(
+                "Anomaly sweep scored %d cities, kept %d temperature and %d humidity rows",
+                len(scored),
+                len(temperature),
+                len(humidity),
+            )
 
-        board = AnomalyBoard(
-            temperature=temperature,
-            humidity=humidity,
-            briefing=briefing,
-            swept_at=datetime.now(UTC),
-            cities_scored=len(scored),
-            source="fresh",
-        )
-        await self._redis.set(BOARD_KEY, board.model_dump_json())
-        return board
+            briefing = await self._brief(temperature, humidity)
+
+            board = AnomalyBoard(
+                temperature=temperature,
+                humidity=humidity,
+                briefing=briefing,
+                swept_at=datetime.now(UTC),
+                cities_scored=len(scored),
+                source="fresh",
+            )
+            await self._redis.set(BOARD_KEY, board.model_dump_json())
+            return board
 
     @staticmethod
     def _score_all(
@@ -153,31 +165,38 @@ class AnomalyBoardService:
         if self._briefer is None or not (temperature or humidity):
             return None
 
-        # Both boards, because the correlations worth naming often span them: a
-        # heat dome shows up as a temperature anomaly and a humidity one in the
-        # same place, and only seeing half of that would hide the connection.
-        top_temperature = temperature[:BRIEFING_ROWS]
-        top_humidity = humidity[:BRIEFING_ROWS]
-        key = BRIEFING_KEY_PREFIX + self._briefing_digest(top_temperature + top_humidity)
+        with tracer.start_as_current_span("anomaly.briefing") as span:
+            # Both boards, because the correlations worth naming often span them: a
+            # heat dome shows up as a temperature anomaly and a humidity one in the
+            # same place, and only seeing half of that would hide the connection.
+            top_temperature = temperature[:BRIEFING_ROWS]
+            top_humidity = humidity[:BRIEFING_ROWS]
+            key = BRIEFING_KEY_PREFIX + self._briefing_digest(top_temperature + top_humidity)
+            span.set_attribute("briefing.rows", len(top_temperature) + len(top_humidity))
 
-        # Keyed by the rows themselves rather than by time, so a sweep that
-        # reproduces the same board -- or a manual refresh during development --
-        # costs nothing.
-        cached = await self._redis.get(key)
-        if cached is not None:
-            return AnomalyBriefing.model_validate_json(cached)
+            # Keyed by the rows themselves rather than by time, so a sweep that
+            # reproduces the same board -- or a manual refresh during development --
+            # costs nothing.
+            cached = await self._redis.get(key)
+            # The attribute is what explains an otherwise alarming trace: a sweep
+            # with no model span under this one is the cache working, not the
+            # briefing silently failing.
+            span.set_attribute("briefing.cache_hit", cached is not None)
+            if cached is not None:
+                return AnomalyBriefing.model_validate_json(cached)
 
-        try:
-            briefing = await self._briefer.brief(top_temperature, top_humidity)
-        except Exception:  # noqa: BLE001 - enrichment must never fail a sweep
-            logger.warning("Anomaly briefing failed; serving board without it", exc_info=True)
-            return None
+            try:
+                briefing = await self._briefer.brief(top_temperature, top_humidity)
+            except Exception:  # noqa: BLE001 - enrichment must never fail a sweep
+                logger.warning("Anomaly briefing failed; serving board without it", exc_info=True)
+                return None
 
-        if briefing is not None:
-            await self._redis.set(
-                key, briefing.model_dump_json(), ex=self._briefing_ttl_seconds
-            )
-        return briefing
+            span.set_attribute("briefing.served", briefing is not None)
+            if briefing is not None:
+                await self._redis.set(
+                    key, briefing.model_dump_json(), ex=self._briefing_ttl_seconds
+                )
+            return briefing
 
     @staticmethod
     def _briefing_digest(rows: list[AnomalyRow]) -> str:

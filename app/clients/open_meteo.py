@@ -19,8 +19,10 @@ import logging
 from dataclasses import dataclass
 
 import httpx
+from opentelemetry import trace
 
 from app.config import Settings
+from app.telemetry import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +66,21 @@ class OpenMeteoClient:
         if not coordinates:
             return []
 
-        results: list[CurrentReading | None] = []
         batch_size = self._settings.anomaly_sweep_batch_size
+        with tracer.start_as_current_span("open_meteo.fetch_current_bulk") as span:
+            span.set_attribute("coordinates.count", len(coordinates))
+            span.set_attribute("batch.size", batch_size)
 
-        for start in range(0, len(coordinates), batch_size):
-            batch = coordinates[start : start + batch_size]
-            results.extend(await self._fetch_one_batch(batch))
+            results: list[CurrentReading | None] = []
+            for start in range(0, len(coordinates), batch_size):
+                batch = coordinates[start : start + batch_size]
+                results.extend(await self._fetch_one_batch(batch))
 
-        return results
+            # Counted rather than inferred from the child spans: a batch that
+            # degraded to None never issued a request, so the HTTP children
+            # alone understate how much of the field is missing.
+            span.set_attribute("readings.missing", sum(1 for r in results if r is None))
+            return results
 
     async def _fetch_one_batch(
         self, batch: list[tuple[float, float]]
@@ -102,7 +111,15 @@ class OpenMeteoClient:
                         "Open-Meteo batch failed with %s after retries", response.status_code
                     )
                     return empty
-                await asyncio.sleep(self._retry_delay(response, attempt))
+                delay = self._retry_delay(response, attempt)
+                # An event rather than a span: the retried request already shows
+                # up twice via httpx instrumentation, so the only part that would
+                # otherwise read as unexplained dead time is this sleep.
+                trace.get_current_span().add_event(
+                    "open_meteo.backoff",
+                    {"http.status_code": response.status_code, "attempt": attempt, "delay": delay},
+                )
+                await asyncio.sleep(delay)
                 continue
 
             if response.status_code != 200:

@@ -23,6 +23,7 @@ from app.exceptions import (
     UpstreamRateLimitedError,
 )
 from app.services.anomaly_board import AnomalyBoardService
+from app.telemetry import configure_tracing
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Weather Cache Service", lifespan=lifespan)
+
+    # Before any add_middleware call: instrumenting the app installs middleware of
+    # its own, and Starlette will not accept more once the stack has been built.
+    configure_tracing(app)
 
     app.add_middleware(
         CORSMiddleware,

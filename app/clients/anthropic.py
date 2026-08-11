@@ -28,10 +28,19 @@ from __future__ import annotations
 import json
 import logging
 
+from opentelemetry.trace import Span, Status, StatusCode
+
 from app.config import Settings
 from app.models.anomaly import AnomalyBriefing, AnomalyRow
+from app.telemetry import tracer
 
 logger = logging.getLogger(__name__)
+
+# Named rather than inline so the request and the span attribute reporting it
+# cannot drift apart.
+MAX_TOKENS = 4096
+THINKING = "adaptive"
+EFFORT = "low"
 
 SYSTEM_PROMPT = """\
 You are a meteorologist writing the editorial note for a global weather anomaly \
@@ -86,30 +95,83 @@ class AnomalyBriefingClient:
 
         import anthropic
 
-        try:
-            response = await self._client.messages.parse(
-                model=self._settings.anthropic_model,
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                thinking={"type": "adaptive"},
-                output_config={"effort": "low"},
-                output_format=AnomalyBriefing,
-                messages=[
-                    {"role": "user", "content": self._render(temperature, humidity)}
-                ],
-            )
-        except anthropic.APIError as exc:
-            logger.warning("Anomaly briefing unavailable: %s", exc)
-            return None
-        except Exception:  # noqa: BLE001 - never let enrichment break a sweep
-            logger.warning("Anomaly briefing failed unexpectedly", exc_info=True)
-            return None
+        # The span covers the whole exchange rather than just the await, so a
+        # refusal and a transport failure are both visible as an errored model
+        # call rather than as an absence. Everything inside it still returns
+        # ``None`` on failure -- instrumentation must not become a way for this
+        # method to start raising.
+        with tracer.start_as_current_span(
+            f"chat {self._settings.anthropic_model}",
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "anthropic",
+                "gen_ai.request.model": self._settings.anthropic_model,
+                "gen_ai.request.max_tokens": MAX_TOKENS,
+                "anthropic.thinking": THINKING,
+                "anthropic.effort": EFFORT,
+                "anomaly.briefing.temperature_rows": len(temperature),
+                "anomaly.briefing.humidity_rows": len(humidity),
+            },
+        ) as span:
+            try:
+                response = await self._client.messages.parse(
+                    model=self._settings.anthropic_model,
+                    max_tokens=MAX_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    thinking={"type": THINKING},
+                    output_config={"effort": EFFORT},
+                    output_format=AnomalyBriefing,
+                    messages=[
+                        {"role": "user", "content": self._render(temperature, humidity)}
+                    ],
+                )
+            except anthropic.APIError as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, "anthropic API error"))
+                logger.warning("Anomaly briefing unavailable: %s", exc)
+                return None
+            except Exception as exc:  # noqa: BLE001 - never let enrichment break a sweep
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, "unexpected briefing failure"))
+                logger.warning("Anomaly briefing failed unexpectedly", exc_info=True)
+                return None
 
-        if response.stop_reason == "refusal":
-            logger.warning("Anomaly briefing refused by safety classifiers")
-            return None
+            self._record_response(span, response)
 
-        return response.parsed_output
+            if response.stop_reason == "refusal":
+                # An error on the span, but not an exception: nothing went wrong
+                # mechanically, the model declined. Recording it as a raised
+                # error would misreport a policy decision as an outage.
+                span.set_status(Status(StatusCode.ERROR, "refused by safety classifiers"))
+                logger.warning("Anomaly briefing refused by safety classifiers")
+                return None
+
+            return response.parsed_output
+
+    @staticmethod
+    def _record_response(span: Span, response: object) -> None:
+        """Copy what came back onto the span, tolerating a thin response.
+
+        Everything is read through ``getattr``: a refusal carries no usage, and
+        a missing token count is not worth turning a served briefing into a
+        failed one.
+        """
+        model = getattr(response, "model", None)
+        if model:
+            span.set_attribute("gen_ai.response.model", model)
+
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason:
+            span.set_attribute("gen_ai.response.finish_reasons", [stop_reason])
+
+        usage = getattr(response, "usage", None)
+        for attribute, field in (
+            ("gen_ai.usage.input_tokens", "input_tokens"),
+            ("gen_ai.usage.output_tokens", "output_tokens"),
+        ):
+            value = getattr(usage, field, None)
+            if isinstance(value, int):
+                span.set_attribute(attribute, value)
 
     @classmethod
     def _render(cls, temperature: list[AnomalyRow], humidity: list[AnomalyRow]) -> str:

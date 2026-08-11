@@ -2,10 +2,19 @@ import fakeredis
 import httpx
 import pytest
 import pytest_asyncio
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from app.api.deps import get_redis
 from app.config import get_settings
 from app.main import create_app, lifespan
+
+# One exporter for the process. The tracer provider is global and can only be
+# installed once, so the alternative -- a provider per test -- would leave every
+# test after the first writing into a provider nothing is reading.
+_SPAN_EXPORTER = InMemorySpanExporter()
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +34,26 @@ def _env(monkeypatch):
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _tracing():
+    """Route the app's spans into memory for the whole session.
+
+    Note this deliberately does *not* go through ``configure_tracing``: that
+    reads OTEL_EXPORTER_OTLP_ENDPOINT and would try to ship spans over the
+    network. The suite exercises the spans, not the exporter.
+    """
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(_SPAN_EXPORTER))
+    trace.set_tracer_provider(provider)
+
+
+@pytest.fixture
+def spans():
+    """The spans finished during this test, newest last."""
+    _SPAN_EXPORTER.clear()
+    return _SPAN_EXPORTER
 
 
 @pytest.fixture
