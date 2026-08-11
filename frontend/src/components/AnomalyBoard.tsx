@@ -84,7 +84,10 @@ function AnomalyRowItem({ row }: { row: AnomalyRow }) {
             }}
           />
         </div>
-        <span className="tabular w-16 text-right text-[12px] font-medium" style={{ color: colour }}>
+        <span
+          className="tabular w-24 shrink-0 text-right text-[12px] font-medium whitespace-nowrap"
+          style={{ color: colour }}
+        >
           {row.z_score.toFixed(1)}σ {row.direction === "above" ? "above" : "below"}
         </span>
       </div>
