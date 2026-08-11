@@ -18,11 +18,12 @@ reading is drawn from. Sigma of monthly means answers a different question ("how
 unusual is this month overall") and is far too small, which would make almost
 every day look extreme.
 
-Ten years rather than the WMO 30-year standard is a deliberate trade. It is a
-third of the fetch volume, and ~300 daily samples per city-month is already
-plenty for a stable sigma; the mean drifts slightly warm relative to a 1961-1990
+Five years rather than the WMO 30-year standard is a deliberate trade. It is a
+sixth of the fetch volume, and ~150 daily samples per city-month already puts the
+error on sigma near 6%; the mean drifts slightly warm relative to a 1961-1990
 baseline, which matters for climate-change attribution but not for "is today
-unusual for this place".
+unusual for this place". --years 3 halves the fetch again at some cost to that
+stability, but note it starts a new window and therefore a new checkpoint.
 
 Rate limits are the binding constraint, and they are a *quota* rather than a
 throughput cap: Open-Meteo weights its allowance by locations x days, not by
@@ -35,26 +36,34 @@ hour.
 That makes pacing, not batch size, the thing that matters. Firing large requests
 as fast as possible is the worst available strategy: each trips the limit, backs
 off, retries the same large request, and makes no progress while still burning
-quota. So this script paces itself well under the ceiling (--rate) rather than
-discovering the ceiling by being throttled.
+quota. Open-Meteo publishes no number for the allowance, so :class:`Pacer` finds
+it -- additive increase while requests succeed, multiplicative decrease on a 429
+-- and the run prints the rate it settled on so the next one can start there.
 
-The default rate is deliberately conservative. Raising it does not obviously
-finish sooner -- past the hourly limit you simply spend the rest of the hour
-being refused. If a run does start reporting repeated "rate limited" lines,
-lower --rate rather than raising it.
+**Deduplicating nearby cities onto a grid was tried and rejected.** The idea was
+that cities sharing a reanalysis cell could share one request. Measurement killed
+it: Hong Kong and Kowloon are 4 km apart and their daily means still differ by
+0.56 C on average, against a local sigma of 1.1 C -- roughly half a sigma of
+fabricated error injected into a board whose entire top ten spans about one
+sigma. Shenzhen and Bao'an, 19 km apart, differ by up to 12 humidity points.
+Open-Meteo's grid is also irregular (a 0.02 degree step can cross a cell
+boundary, and spacing near Paris measured ~0.149 degrees), so cells cannot be
+predicted by rounding anyway. It would have saved 12-25% of requests and silently
+corrupted the rankings.
 
-At the default the whole 33,957-city index over 5 years is on the order of a day
-or two. That is fine -- it runs once and the output is committed -- but it means
-the script must be resumable, and it is: progress is checkpointed per city and a
-re-run picks up where it stopped. Scope it with --cities to get a usable board
-sooner; a later unscoped run continues into the same checkpoint, and cities not
-yet fetched are simply absent from the board rather than wrong on it.
+Scope is therefore the main lever, and --min-population is the knob: the default
+of 100,000 covers ~6,200 cities, a fifth of the index, and drops the towns whose
+names would mean nothing at the top of a global board.
 
-    # a few thousand of the largest cities, good for a working board
-    python scripts/build_climate_normals.py --cities 2000
+Coverage is partial-friendly at every stage -- cities not yet fetched are NaN and
+simply absent from the board rather than wrong on it -- so a long run can be
+stopped, packed with --write-only, and resumed later.
 
-    # the whole index; expect days, run it detached and re-run to resume
+    # the default: cities over 100k, a working global board
     python scripts/build_climate_normals.py
+
+    # the whole index; expect a day or more, re-run to resume
+    python scripts/build_climate_normals.py --min-population 0
 
 Data: Open-Meteo ERA5 reanalysis, CC BY 4.0 -- see app/data/ATTRIBUTION.md.
 """
@@ -126,12 +135,14 @@ def _fetch(url: str, *, timeout: float) -> object:
 
 def _fetch_batch(
     batch: list[CityRecord], start: str, end: str, *, timeout: float
-) -> list[dict] | None:
+) -> tuple[list[dict] | None, bool]:
     """One archive request covering every city in ``batch``.
 
-    Returns ``None`` only for a non-retryable failure, in which case the caller
-    drops the batch rather than aborting the run -- a handful of missing cities
-    is a far better outcome than losing hours of accumulated progress.
+    Returns ``(results, throttled)``. ``results`` is ``None`` for a non-retryable
+    failure, in which case the caller drops the batch rather than aborting the
+    run -- a handful of missing cities is a far better outcome than losing hours
+    of accumulated progress. ``throttled`` tells the pacer it overshot, whether
+    or not the batch eventually succeeded.
     """
     query = urllib.parse.urlencode(
         {
@@ -148,17 +159,19 @@ def _fetch_batch(
     url = f"{ARCHIVE_URL}?{query}"
 
     delay = 60.0
+    throttled = False
     for attempt in range(6):
         try:
             payload = _fetch(url, timeout=timeout)
         except RateLimited:
+            throttled = True
             # Skip the batch rather than raise. This job runs for hours, and
             # letting one exhausted batch abort it would throw away every city
             # fetched since the last restart -- the opposite of resumable. The
             # cities land in a later run instead.
             if attempt == 5:
                 print("    still rate limited after backoff; batch deferred", flush=True)
-                return None
+                return None, throttled
             print(f"    rate limited, sleeping {delay:.0f}s", flush=True)
             time.sleep(delay)
             delay = min(delay * 1.5, 600.0)
@@ -166,17 +179,17 @@ def _fetch_batch(
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             if attempt == 5:
                 print(f"    giving up on batch: {type(exc).__name__} {exc}", flush=True)
-                return None
+                return None, throttled
             time.sleep(10.0 * (attempt + 1))
             continue
 
         # A single-location request returns an object, not a list.
         if isinstance(payload, dict):
-            return [payload]
+            return [payload], throttled
         if isinstance(payload, list):
-            return payload
-        return None
-    return None
+            return payload, throttled
+        return None, throttled
+    return None, throttled
 
 
 def _accumulate(daily: dict) -> list[list[float]]:
@@ -258,12 +271,66 @@ def _geonameid_digest(cities: list[CityRecord]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
-def build(
-    city_limit: int | None, years: int, batch_size: int, timeout: float, rate: float
-) -> None:
+class Pacer:
+    """Finds the quota ceiling instead of guessing under it.
+
+    Open-Meteo publishes no number for the weighted hourly allowance, so a fixed
+    rate is either too slow (most of the budget unused, for hours) or too fast
+    (throttled, and then the whole hour is spent being refused). Neither is
+    discoverable in advance.
+
+    So: additive increase, multiplicative decrease -- the same shape as TCP
+    congestion control, for the same reason. Nudge the rate up while requests
+    succeed, halve it the moment one is refused, and settle just under whatever
+    the real limit turns out to be. Decrease is aggressive and increase is gentle
+    because the two errors are not symmetric: overshooting costs the remainder of
+    the hour, undershooting costs a few seconds.
+    """
+
+    def __init__(self, rate: float, ceiling: float = 600.0):
+        self.rate = rate
+        self._ceiling = ceiling
+        self._observed_limit: float | None = None
+
+    def on_success(self) -> None:
+        # Once throttling has been seen, stay below where it happened rather
+        # than climbing back into it.
+        cap = self._observed_limit * 0.9 if self._observed_limit else self._ceiling
+        self.rate = min(self.rate * 1.08, cap)
+
+    def on_throttled(self) -> None:
+        self._observed_limit = self.rate
+        self.rate = max(self.rate * 0.5, 5.0)
+
+    def seconds_between(self, location_years: int) -> float:
+        return location_years / self.rate * 60.0
+
+
+def _select_cities(city_limit: int | None, min_population: int) -> list[CityRecord]:
+    """The cities to cover, in index order.
+
+    Index order is the contract -- the artefact is written by position -- so this
+    filters rather than reorders. Population is the natural scope knob: "the most
+    anomalous city on Earth" means more as Lisbon than as a town of 15,000, and
+    every city dropped is quota spent somewhere more interesting.
+    """
     cities = city_records()
+    if min_population > 0:
+        cities = [city for city in cities if city.population >= min_population]
     if city_limit is not None:
         cities = cities[:city_limit]
+    return cities
+
+
+def build(
+    city_limit: int | None,
+    min_population: int,
+    years: int,
+    batch_size: int,
+    timeout: float,
+    rate: float,
+) -> None:
+    cities = _select_cities(city_limit, min_population)
 
     end_year = datetime.now(UTC).year - 1
     start = f"{end_year - years + 1}-01-01"
@@ -273,26 +340,26 @@ def build(
     done = _load_checkpoint(checkpoint_path)
     pending = [city for city in cities if city.geonameid not in done]
 
-    # One request costs batch_size * years location-years of quota, so this is
-    # how long that request has to be spaced from the next one to stay under the
-    # allowance. Sleeping the remainder is strictly better than being throttled.
-    seconds_per_batch = (batch_size * years) / rate * 60.0
+    pacer = Pacer(rate)
 
     print(f"cities={len(cities):,} window={start}..{end}")
     print(f"already checkpointed={len(done):,} remaining={len(pending):,}")
     if pending:
-        print(
-            f"pacing at {rate:.0f} location-years/min "
-            f"-> {seconds_per_batch:.0f}s between batches"
-        )
-        print(f"~{len(pending) * years / rate / 60:.1f}h remaining\n")
+        print(f"starting at {rate:.0f} location-years/min, adapting from there")
+        print(f"~{len(pending) * years / rate / 60:.1f}h remaining at the starting rate\n")
 
     started = time.time()
     with checkpoint_path.open("a", encoding="utf-8") as checkpoint:
         for offset in range(0, len(pending), batch_size):
             batch = pending[offset : offset + batch_size]
             batch_started = time.time()
-            results = _fetch_batch(batch, start, end, timeout=timeout)
+            results, throttled = _fetch_batch(batch, start, end, timeout=timeout)
+
+            if throttled:
+                pacer.on_throttled()
+            else:
+                pacer.on_success()
+
             if results is None:
                 continue
 
@@ -321,28 +388,42 @@ def build(
             eta = (len(pending) - complete) / observed / 60 if observed else 0
             print(
                 f"  {complete:>6,}/{len(pending):,} cities  "
-                f"{observed * 60:>5.0f} cities/min  eta {eta:>5.1f}m",
+                f"{observed * 60:>5.0f} cities/min  "
+                f"pace {pacer.rate:>4.0f} loc-yr/min  eta {eta:>5.1f}m",
                 flush=True,
             )
 
             if offset + batch_size < len(pending):
-                remaining = seconds_per_batch - (time.time() - batch_started)
+                remaining = pacer.seconds_between(len(batch) * years) - (
+                    time.time() - batch_started
+                )
                 if remaining > 0:
                     time.sleep(remaining)
+
+    print(f"\nsettled pacing rate: {pacer.rate:.0f} location-years/min")
+    print(f"  pass --rate {pacer.rate:.0f} on the next run to start there")
 
     _write_artifact(cities, done, start, end, years)
 
 
 def _write_artifact(
-    cities: list[CityRecord], done: dict[int, list[float]], start: str, end: str, years: int
+    _selected: list[CityRecord], done: dict[int, list[float]], start: str, end: str, years: int
 ) -> None:
-    """Write the packed array in city-index order.
+    """Write the packed array over the **whole** city index, in index order.
 
     Order is the contract: the runtime store looks a city up by its position in
     the city index, so a row here must correspond to the same position there.
-    Cities that were never fetched are written as NaN rather than skipped, which
-    keeps that positional correspondence exact.
+
+    That is why this writes every city rather than just the ones selected for
+    this run. Once the selection can be a population filter rather than a prefix,
+    position-within-the-selection stops matching position-within-the-index, and
+    an artefact packed densely would hand each city its neighbour's climate --
+    silently, since nothing downstream could detect it. Cities never fetched are
+    NaN, which costs little (they compress to almost nothing) and keeps the
+    correspondence exact.
     """
+    cities = city_records()
+
     flat = array("f")
     covered = 0
     for city in cities:
@@ -393,7 +474,16 @@ def main() -> None:
         "--cities",
         type=int,
         default=None,
-        help="only the N most populous cities (default: the whole index)",
+        help="cap at the N most populous cities after --min-population is applied",
+    )
+    parser.add_argument(
+        "--min-population",
+        type=int,
+        default=100_000,
+        help=(
+            "only cities at least this populous (default: 100000, ~6,200 cities). "
+            "Pass 0 for the whole 33,957-city index."
+        ),
     )
     parser.add_argument("--years", type=int, default=10, help="years of history (default: 10)")
     parser.add_argument("--batch", type=int, default=40, help="cities per request (default: 40)")
@@ -416,9 +506,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.write_only:
-        cities = city_records()
-        if args.cities is not None:
-            cities = cities[: args.cities]
+        cities = _select_cities(args.cities, args.min_population)
         end_year = datetime.now(UTC).year - 1
         start = f"{end_year - args.years + 1}-01-01"
         end = f"{end_year}-12-31"
@@ -426,7 +514,14 @@ def main() -> None:
         _write_artifact(cities, checkpoint, start, end, args.years)
         return
 
-    build(args.cities, args.years, args.batch, args.timeout, args.rate)
+    build(
+        args.cities,
+        args.min_population,
+        args.years,
+        args.batch,
+        args.timeout,
+        args.rate,
+    )
 
 
 if __name__ == "__main__":

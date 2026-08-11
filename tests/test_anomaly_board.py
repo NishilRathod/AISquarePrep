@@ -35,9 +35,7 @@ def make_normals(n: int, mean_t=20.0, sd_t=2.0, mean_h=60.0, sd_h=5.0) -> Normal
     for _ in range(n):
         for _ in range(MONTHS):
             values.extend([mean_t, sd_t, mean_h, sd_h])
-    return NormalsStore(
-        values=values, n_cities=n, window_start="", window_end="", cities_covered=n
-    )
+    return NormalsStore.from_values(values, n)
 
 
 class StubClient:
@@ -56,8 +54,9 @@ class StubBriefer:
         self.error = error
         self.calls = 0
 
-    async def brief(self, rows):
+    async def brief(self, temperature, humidity):
         self.calls += 1
+        self.seen = (temperature, humidity)
         if self.error is not None:
             raise self.error
         return self.result
@@ -99,8 +98,8 @@ class TestSweep:
 
         assert board.source == "fresh"
         # City2 is exactly normal, so it never reaches the board.
-        assert [r.city for r in board.rows] == ["City0", "City1"]
-        assert board.rows[0].rank == 1
+        assert [r.city for r in board.temperature] == ["City0", "City1"]
+        assert board.temperature[0].rank == 1
         assert await fake_redis.get(BOARD_KEY) is not None
 
     async def test_cities_without_a_reading_are_skipped(self, fake_redis, patched):
@@ -109,7 +108,7 @@ class TestSweep:
             fake_redis, StubClient([reading(temp=28.0), None, reading(temp=27.0)]), 50
         )
         board = await service.sweep()
-        assert [r.city for r in board.rows] == ["City0", "City2"]
+        assert [r.city for r in board.temperature] == ["City0", "City2"]
 
     async def test_month_comes_from_the_city_local_date(self, fake_redis, patched):
         """A city scored against the wrong month's baseline is silently wrong."""
@@ -120,20 +119,18 @@ class TestSweep:
                 values.extend([20.0, 2.0, 60.0, 5.0])
             else:
                 values.extend([float("nan")] * 4)
-        store = NormalsStore(
-            values=values, n_cities=1, window_start="", window_end="", cities_covered=1
-        )
+        store = NormalsStore.from_values(values, 1)
 
         patched(1, normals=store)
         june = AnomalyBoardService(
             fake_redis, StubClient([reading(temp=28.0, date="2026-06-15")]), 50
         )
-        assert (await june.sweep()).rows == []
+        assert (await june.sweep()).temperature == []
 
         july = AnomalyBoardService(
             fake_redis, StubClient([reading(temp=28.0, date="2026-07-15")]), 50
         )
-        assert len((await july.sweep()).rows) == 1
+        assert len((await july.sweep()).temperature) == 1
 
     async def test_missing_artefact_yields_an_empty_board_not_an_error(
         self, fake_redis, patched, monkeypatch
@@ -146,7 +143,7 @@ class TestSweep:
         monkeypatch.setattr(anomaly_board, "load_normals", boom)
         board = await AnomalyBoardService(fake_redis, StubClient([]), 50).sweep()
         assert board.source == "unavailable"
-        assert board.rows == []
+        assert board.temperature == [] and board.humidity == []
 
 
 class TestBriefingDegradation:
@@ -162,15 +159,15 @@ class TestBriefingDegradation:
 
         assert briefer.calls == 1
         assert board.briefing is None
-        assert len(board.rows) == 2
-        assert board.rows[0].z_score == 4.0
+        assert len(board.temperature) == 2
+        assert board.temperature[0].z_score == 4.0
 
     async def test_no_briefer_configured_still_ranks(self, fake_redis, patched):
         patched(1)
         service = AnomalyBoardService(fake_redis, StubClient([reading(temp=28.0)]), 50, None)
         board = await service.sweep()
         assert board.briefing is None
-        assert len(board.rows) == 1
+        assert len(board.temperature) == 1
 
     async def test_briefing_is_cached_by_board_content(self, fake_redis, patched):
         patched(1)
@@ -193,7 +190,7 @@ class TestGetBoard:
     async def test_cold_start_is_not_an_error(self, fake_redis):
         board = await AnomalyBoardService(fake_redis, StubClient([]), 50).get_board(10)
         assert board.source == "unavailable"
-        assert board.rows == []
+        assert board.temperature == [] and board.humidity == []
         assert board.swept_at is None
 
     async def test_reads_do_not_sweep(self, fake_redis, patched):
@@ -212,5 +209,58 @@ class TestGetBoard:
         service = AnomalyBoardService(fake_redis, StubClient(readings), 50)
         await service.sweep()
 
-        assert len((await service.get_board(2)).rows) == 2
-        assert len((await service.get_board(50)).rows) == 5
+        assert len((await service.get_board(2)).temperature) == 2
+        assert len((await service.get_board(50)).temperature) == 5
+
+
+class TestBothBoards:
+    async def test_one_sweep_populates_both_boards_independently(self, fake_redis, patched):
+        """The reason the boards were split.
+
+        City0 is a temperature extreme with normal humidity; City1 is the
+        reverse. A single combined ranking would order them by whichever
+        departure was larger and let one variable own the visible top of the
+        board; ranking each variable separately keeps both visible.
+        """
+        patched(2)
+        readings = [
+            reading(temp=28.0, humidity=60.0),  # 4.0 sigma temp, flat humidity
+            reading(temp=20.0, humidity=85.0),  # flat temp, 5.0 sigma humidity
+        ]
+        service = AnomalyBoardService(fake_redis, StubClient(readings), 50)
+
+        board = await service.sweep()
+
+        assert [r.city for r in board.temperature] == ["City0"]
+        assert [r.city for r in board.humidity] == ["City1"]
+        assert board.temperature[0].z_score == 4.0
+        assert board.humidity[0].z_score == 5.0
+
+    async def test_a_city_extreme_in_both_appears_on_both(self, fake_redis, patched):
+        patched(1)
+        service = AnomalyBoardService(
+            fake_redis, StubClient([reading(temp=28.0, humidity=85.0)]), 50
+        )
+        board = await service.sweep()
+
+        assert board.temperature[0].city == "City0"
+        assert board.humidity[0].city == "City0"
+        # Same city, different headline per board.
+        assert board.temperature[0].z_score == 4.0
+        assert board.humidity[0].z_score == 5.0
+
+    async def test_briefing_receives_both_boards(self, fake_redis, patched):
+        patched(2)
+        briefer = StubBriefer(result=BRIEFING)
+        service = AnomalyBoardService(
+            fake_redis,
+            StubClient([reading(temp=28.0, humidity=60.0), reading(temp=20.0, humidity=85.0)]),
+            50,
+            briefer,
+        )
+
+        await service.sweep()
+
+        temperature, humidity = briefer.seen
+        assert [r.city for r in temperature] == ["City0"]
+        assert [r.city for r in humidity] == ["City1"]

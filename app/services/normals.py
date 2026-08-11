@@ -49,6 +49,46 @@ class NormalsStore:
     window_start: str
     window_end: str
     cities_covered: int
+    # Index positions that actually have a baseline. The artefact spans the whole
+    # city index so that positional lookups stay exact, but most of it can be
+    # empty -- the sweep uses this to ask upstream only about cities it could
+    # score, instead of spending a request per city it would then discard.
+    covered_row_indices: tuple[int, ...]
+
+    @classmethod
+    def from_values(
+        cls,
+        values: array,
+        n_cities: int,
+        *,
+        window_start: str = "",
+        window_end: str = "",
+    ) -> NormalsStore:
+        """Build a store, deriving coverage from the data itself.
+
+        Coverage is read from the array rather than trusted from the metadata, so
+        the two cannot disagree about which cities are scoreable.
+        """
+        covered = tuple(
+            row_index
+            for row_index in range(n_cities)
+            # Any usable month makes a city worth sweeping. Checking a single
+            # month instead would drop cities whose data is seasonally patchy --
+            # a month with too few samples is written NaN individually, so
+            # coverage is genuinely per-month rather than per-city.
+            if any(
+                not math.isnan(values[(row_index * MONTHS + month) * STATS])
+                for month in range(MONTHS)
+            )
+        )
+        return cls(
+            values=values,
+            n_cities=n_cities,
+            window_start=window_start,
+            window_end=window_end,
+            cities_covered=len(covered),
+            covered_row_indices=covered,
+        )
 
     def get(self, row_index: int, month: int) -> Normals | None:
         """Baseline for a city index position and a 1-based calendar month.
@@ -113,10 +153,9 @@ def load_normals() -> NormalsStore:
             f"normals artefact holds {len(values):,} floats, expected {expected_len:,}"
         )
 
-    return NormalsStore(
-        values=values,
-        n_cities=n_cities,
+    return NormalsStore.from_values(
+        values,
+        n_cities,
         window_start=str(meta.get("window_start", "")),
         window_end=str(meta.get("window_end", "")),
-        cities_covered=int(meta.get("cities_covered", 0)),
     )

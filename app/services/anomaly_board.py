@@ -16,7 +16,7 @@ from redis.asyncio import Redis
 
 from app.clients.open_meteo import CurrentReading, OpenMeteoClient
 from app.models.anomaly import AnomalyBoard, AnomalyBriefing, AnomalyRow
-from app.services.anomaly import Observation, rank_rows, score_city
+from app.services.anomaly import Observation, rank_by, score_city
 from app.services.city_index import CityRecord, city_records
 from app.services.normals import NormalsStore, NormalsUnavailableError, load_normals
 
@@ -49,12 +49,17 @@ class AnomalyBoardService:
         """Serve the stored board. Never sweeps, never blocks on upstream."""
         raw = await self._redis.get(BOARD_KEY)
         if raw is None:
-            return AnomalyBoard(
-                rows=[], briefing=None, swept_at=None, cities_scored=0, source="unavailable"
-            )
+            return _empty_board()
 
         board = AnomalyBoard.model_validate_json(raw)
-        return board.model_copy(update={"rows": board.rows[:limit]})
+        # The limit applies per board, so asking for ten gets ten of each rather
+        # than ten split between them.
+        return board.model_copy(
+            update={
+                "temperature": board.temperature[:limit],
+                "humidity": board.humidity[:limit],
+            }
+        )
 
     async def sweep(self) -> AnomalyBoard:
         """Fetch current conditions for every covered city, score, rank, store."""
@@ -62,25 +67,41 @@ class AnomalyBoardService:
             normals = load_normals()
         except NormalsUnavailableError as exc:
             logger.warning("Anomaly sweep skipped: %s", exc)
-            return AnomalyBoard(
-                rows=[], briefing=None, swept_at=None, cities_scored=0, source="unavailable"
-            )
+            return _empty_board()
 
-        cities = city_records()[: normals.n_cities]
-        logger.info("Anomaly sweep starting over %d cities", len(cities))
+        # Only cities with a baseline. Fetching the rest would be a request per
+        # city whose reading is then discarded for having nothing to compare to.
+        all_cities = city_records()
+        cities = [
+            all_cities[row_index]
+            for row_index in normals.covered_row_indices
+            if row_index < len(all_cities)
+        ]
+        logger.info(
+            "Anomaly sweep starting over %d cities with a baseline (of %d in the index)",
+            len(cities),
+            len(all_cities),
+        )
 
         readings = await self._client.fetch_current_bulk(
             [(city.latitude, city.longitude) for city in cities]
         )
 
         scored = self._score_all(cities, readings, normals)
-        rows = rank_rows(scored, self._board_size)
-        logger.info("Anomaly sweep scored %d cities, kept %d", len(scored), len(rows))
+        temperature = rank_by(scored, "temperature", self._board_size)
+        humidity = rank_by(scored, "humidity", self._board_size)
+        logger.info(
+            "Anomaly sweep scored %d cities, kept %d temperature and %d humidity rows",
+            len(scored),
+            len(temperature),
+            len(humidity),
+        )
 
-        briefing = await self._brief(rows)
+        briefing = await self._brief(temperature, humidity)
 
         board = AnomalyBoard(
-            rows=rows,
+            temperature=temperature,
+            humidity=humidity,
             briefing=briefing,
             swept_at=datetime.now(UTC),
             cities_scored=len(scored),
@@ -126,12 +147,18 @@ class AnomalyBoardService:
 
         return scored
 
-    async def _brief(self, rows: list[AnomalyRow]) -> AnomalyBriefing | None:
-        if self._briefer is None or not rows:
+    async def _brief(
+        self, temperature: list[AnomalyRow], humidity: list[AnomalyRow]
+    ) -> AnomalyBriefing | None:
+        if self._briefer is None or not (temperature or humidity):
             return None
 
-        subject = rows[:BRIEFING_ROWS]
-        key = BRIEFING_KEY_PREFIX + self._briefing_digest(subject)
+        # Both boards, because the correlations worth naming often span them: a
+        # heat dome shows up as a temperature anomaly and a humidity one in the
+        # same place, and only seeing half of that would hide the connection.
+        top_temperature = temperature[:BRIEFING_ROWS]
+        top_humidity = humidity[:BRIEFING_ROWS]
+        key = BRIEFING_KEY_PREFIX + self._briefing_digest(top_temperature + top_humidity)
 
         # Keyed by the rows themselves rather than by time, so a sweep that
         # reproduces the same board -- or a manual refresh during development --
@@ -141,7 +168,7 @@ class AnomalyBoardService:
             return AnomalyBriefing.model_validate_json(cached)
 
         try:
-            briefing = await self._briefer.brief(subject)
+            briefing = await self._briefer.brief(top_temperature, top_humidity)
         except Exception:  # noqa: BLE001 - enrichment must never fail a sweep
             logger.warning("Anomaly briefing failed; serving board without it", exc_info=True)
             return None
@@ -167,8 +194,26 @@ class AnomalyBoardService:
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _empty_board() -> AnomalyBoard:
+    """What every caller gets before the first sweep, or when normals are missing.
+
+    A 200 with nothing in it, rather than an error: a dashboard should not break
+    because a background job has not run yet.
+    """
+    return AnomalyBoard(
+        temperature=[],
+        humidity=[],
+        briefing=None,
+        swept_at=None,
+        cities_scored=0,
+        source="unavailable",
+    )
+
+
 class BriefingProvider:
     """Structural type for the interpretation layer (see app/clients/anthropic.py)."""
 
-    async def brief(self, rows: list[AnomalyRow]) -> AnomalyBriefing | None:  # pragma: no cover
+    async def brief(  # pragma: no cover
+        self, temperature: list[AnomalyRow], humidity: list[AnomalyRow]
+    ) -> AnomalyBriefing | None:
         raise NotImplementedError

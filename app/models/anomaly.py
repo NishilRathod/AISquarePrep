@@ -8,7 +8,13 @@ Direction = Literal["above", "below"]
 
 
 class AnomalyRow(BaseModel):
-    """One city on the board, with everything needed to audit its own ranking."""
+    """One city on one board, with everything needed to audit its own ranking.
+
+    Both z-scores are always present, so a row taken from the temperature board
+    still shows what its humidity was doing. ``rank``, ``z_score``, ``driver``
+    and ``direction`` describe the board this copy came from -- the same city can
+    appear on both boards with a different headline on each.
+    """
 
     rank: int
     city: str
@@ -57,7 +63,15 @@ class AnomalyBriefing(BaseModel):
 
 
 class AnomalyBoard(BaseModel):
-    rows: list[AnomalyRow]
+    """Two rankings over the same sweep, one per variable.
+
+    Split rather than combined because a single ranking on the larger of the two
+    departures lets one variable sweep the entire visible top ten on any day it
+    happens to be dramatic, hiding the other half of the weather entirely.
+    """
+
+    temperature: list[AnomalyRow]
+    humidity: list[AnomalyRow]
     briefing: AnomalyBriefing | None
     swept_at: datetime | None
     cities_scored: int

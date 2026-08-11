@@ -85,38 +85,38 @@ def briefing_client(settings, monkeypatch):
 
 async def test_returns_the_parsed_briefing(briefing_client):
     client, _ = briefing_client(result=BRIEFING)
-    result = await client.brief([row()])
+    result = await client.brief([row()], [])
     assert result is not None
     assert result.events[0].cities == ["Hong Kong", "Shenzhen"]
 
 
 async def test_empty_board_never_calls_the_api(briefing_client):
     client, stub = briefing_client(result=BRIEFING)
-    assert await client.brief([]) is None
+    assert await client.brief([], []) is None
     assert stub.kwargs is None
 
 
 async def test_api_error_degrades_to_none(briefing_client):
     error = anthropic.APIError("down", request=None, body=None)
     client, _ = briefing_client(error=error)
-    assert await client.brief([row()]) is None
+    assert await client.brief([row()], []) is None
 
 
 async def test_unexpected_error_degrades_to_none(briefing_client):
     client, _ = briefing_client(error=RuntimeError("something else entirely"))
-    assert await client.brief([row()]) is None
+    assert await client.brief([row()], []) is None
 
 
 async def test_refusal_degrades_to_none(briefing_client):
     client, _ = briefing_client(result=BRIEFING, stop_reason="refusal")
-    assert await client.brief([row()]) is None
+    assert await client.brief([row()], []) is None
 
 
 async def test_request_asks_for_structured_output_on_the_configured_model(
     briefing_client, settings
 ):
     client, stub = briefing_client(result=BRIEFING)
-    await client.brief([row()])
+    await client.brief([row()], [])
 
     assert stub.kwargs["model"] == settings.anthropic_model
     assert stub.kwargs["output_format"] is AnomalyBriefing
@@ -126,7 +126,7 @@ async def test_request_asks_for_structured_output_on_the_configured_model(
 async def test_prompt_supplies_coordinates_and_forbids_recomputation(briefing_client):
     """Grouping is geographic, and the ranking is not up for renegotiation."""
     client, stub = briefing_client(result=BRIEFING)
-    await client.brief([row()])
+    await client.brief([row()], [])
 
     content = stub.kwargs["messages"][0]["content"]
     assert '"lat": 22.28' in content

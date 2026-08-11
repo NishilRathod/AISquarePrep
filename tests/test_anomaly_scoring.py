@@ -1,7 +1,7 @@
 import pytest
 
 from app.models.anomaly import AnomalyRow
-from app.services.anomaly import MAX_PLAUSIBLE_Z, Observation, rank_rows, score_city, z_score
+from app.services.anomaly import MAX_PLAUSIBLE_Z, Observation, rank_by, score_city, z_score
 from app.services.city_index import CityRecord
 from app.services.normals import Normals
 
@@ -62,38 +62,34 @@ class TestZScore:
 
 
 class TestScoreCity:
-    def test_ranks_on_the_stronger_departure_not_the_average(self):
-        """Averaging would let a normal humidity halve a real temperature extreme."""
+    def test_carries_both_variables_independently(self):
+        """Neither variable is collapsed into the other at scoring time."""
+        row = score_city(city("A"), observe(temp=28.0, humidity=80.0), normals())
+        assert row is not None
+        assert row.z_temperature == 4.0
+        assert row.z_humidity == 4.0
+
+    def test_a_normal_variable_does_not_dilute_an_extreme_one(self):
         row = score_city(city("A"), observe(temp=28.0, humidity=60.0), normals())
         assert row is not None
         assert row.z_temperature == 4.0
         assert row.z_humidity == 0.0
-        assert row.z_score == 4.0  # not 2.0
-        assert row.driver == "temperature"
 
-    def test_humidity_can_drive_the_ranking(self):
-        row = score_city(city("A"), observe(temp=20.5, humidity=80.0), normals())
+    def test_signs_are_preserved(self):
+        row = score_city(city("A"), observe(temp=12.0), normals())
         assert row is not None
-        assert row.driver == "humidity"
-        assert row.z_score == 4.0
+        assert row.z_temperature == -4.0
 
-    def test_direction_reflects_sign_but_score_is_magnitude(self):
-        cold = score_city(city("A"), observe(temp=12.0), normals())
-        assert cold is not None
-        assert cold.direction == "below"
-        assert cold.z_score == 4.0
-        assert cold.z_temperature == -4.0
+    def test_city_with_neither_variable_usable_is_dropped(self):
+        assert score_city(city("A"), observe(), normals()) is None
 
-    def test_implausible_departures_are_dropped_as_likely_faults(self):
+    def test_city_with_only_an_implausible_reading_is_dropped(self):
         beyond = 20.0 + (MAX_PLAUSIBLE_Z + 1) * 2.0
         assert score_city(city("A"), observe(temp=beyond), normals()) is None
 
-    def test_unremarkable_city_is_dropped(self):
-        assert score_city(city("A"), observe(), normals()) is None
 
-
-class TestRankRows:
-    def make(self, name, z, *, population, geonameid):
+class TestRankBy:
+    def make(self, name, *, z_t=0.0, z_h=0.0, population=100, geonameid=1):
         record = city(name, population=population, geonameid=geonameid)
         row = AnomalyRow(
             rank=0,
@@ -108,9 +104,9 @@ class TestRankRows:
             normal_humidity_pct=60.0,
             sd_temperature_c=2.0,
             sd_humidity_pct=5.0,
-            z_temperature=z,
-            z_humidity=0.0,
-            z_score=z,
+            z_temperature=z_t,
+            z_humidity=z_h,
+            z_score=0.0,
             driver="temperature",
             direction="above",
         )
@@ -118,26 +114,66 @@ class TestRankRows:
 
     def test_orders_by_magnitude_and_assigns_ranks(self):
         rows = [
-            self.make("Low", 1.0, population=100, geonameid=1),
-            self.make("High", 5.0, population=100, geonameid=2),
-            self.make("Mid", 3.0, population=100, geonameid=3),
+            self.make("Low", z_t=1.0, geonameid=1),
+            self.make("High", z_t=5.0, geonameid=2),
+            self.make("Mid", z_t=3.0, geonameid=3),
         ]
-        ranked = rank_rows(rows, 10)
+        ranked = rank_by(rows, "temperature", 10)
         assert [r.city for r in ranked] == ["High", "Mid", "Low"]
         assert [r.rank for r in ranked] == [1, 2, 3]
+
+    def test_each_board_ranks_on_its_own_variable(self):
+        """The point of splitting: one variable cannot sweep the other's board."""
+        rows = [
+            self.make("Muggy", z_t=0.5, z_h=6.0, geonameid=1),
+            self.make("Scorching", z_t=5.0, z_h=0.4, geonameid=2),
+        ]
+        assert [r.city for r in rank_by(rows, "temperature", 10)] == ["Scorching", "Muggy"]
+        assert [r.city for r in rank_by(rows, "humidity", 10)] == ["Muggy", "Scorching"]
+
+    def test_a_city_can_top_both_boards(self):
+        rows = [self.make("Extreme", z_t=5.0, z_h=6.0, geonameid=1)]
+        assert rank_by(rows, "temperature", 10)[0].z_score == 5.0
+        assert rank_by(rows, "humidity", 10)[0].z_score == 6.0
+
+    def test_headline_fields_describe_the_board_the_row_came_from(self):
+        rows = [self.make("City", z_t=-4.0, z_h=3.0, geonameid=1)]
+
+        temp = rank_by(rows, "temperature", 10)[0]
+        assert (temp.driver, temp.z_score, temp.direction) == ("temperature", 4.0, "below")
+
+        hum = rank_by(rows, "humidity", 10)[0]
+        assert (hum.driver, hum.z_score, hum.direction) == ("humidity", 3.0, "above")
+
+        # Both raw z-scores survive on either copy, so a row stays auditable.
+        assert temp.z_humidity == 3.0 and hum.z_temperature == -4.0
+
+    def test_a_variable_with_no_departure_is_excluded_from_its_board(self):
+        rows = [self.make("TempOnly", z_t=4.0, z_h=0.0, geonameid=1)]
+        assert len(rank_by(rows, "temperature", 10)) == 1
+        assert rank_by(rows, "humidity", 10) == []
+
+    def test_an_implausible_reading_does_not_suppress_the_other_variable(self):
+        """A broken humidity sensor must not cost the city its temperature row."""
+        rows = [self.make("Half", z_t=4.0, z_h=MAX_PLAUSIBLE_Z + 5, geonameid=1)]
+        assert [r.city for r in rank_by(rows, "temperature", 10)] == ["Half"]
+        assert rank_by(rows, "humidity", 10) == []
 
     def test_ties_break_deterministically(self):
         """Two sweeps over identical data must not reshuffle the leaderboard."""
         rows = [
-            self.make("Small", 3.0, population=100, geonameid=9),
-            self.make("Big", 3.0, population=900, geonameid=8),
+            self.make("Small", z_t=3.0, population=100, geonameid=9),
+            self.make("Big", z_t=3.0, population=900, geonameid=8),
         ]
-        assert [r.city for r in rank_rows(rows, 10)] == ["Big", "Small"]
-        assert [r.city for r in rank_rows(list(reversed(rows)), 10)] == ["Big", "Small"]
+        assert [r.city for r in rank_by(rows, "temperature", 10)] == ["Big", "Small"]
+        assert [r.city for r in rank_by(list(reversed(rows)), "temperature", 10)] == [
+            "Big",
+            "Small",
+        ]
 
     def test_respects_the_limit(self):
-        rows = [self.make(f"C{i}", float(i), population=1, geonameid=i) for i in range(1, 20)]
-        assert len(rank_rows(rows, 5)) == 5
+        rows = [self.make(f"C{i}", z_t=float(i), geonameid=i) for i in range(1, 20)]
+        assert len(rank_by(rows, "temperature", 5)) == 5
 
 
 @pytest.mark.parametrize("month", [0, 13, -1])
@@ -146,11 +182,5 @@ def test_normals_reject_out_of_range_months(month, tmp_path):
 
     from app.services.normals import NormalsStore
 
-    store = NormalsStore(
-        values=array("f", [0.0] * 48),
-        n_cities=1,
-        window_start="",
-        window_end="",
-        cities_covered=1,
-    )
+    store = NormalsStore.from_values(array("f", [0.0] * 48), 1)
     assert store.get(0, month) is None

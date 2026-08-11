@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from app.models.anomaly import AnomalyRow
+from app.models.anomaly import AnomalyRow, Driver
 from app.services.city_index import CityRecord
 from app.services.normals import Normals
 
@@ -49,7 +49,14 @@ def z_score(observed: float, mean: float, sd: float) -> float:
 
 
 def score_city(city: CityRecord, observation: Observation, normals: Normals) -> AnomalyRow | None:
-    """Score one city, or ``None`` if it should not appear on the board."""
+    """Score one city on both variables, or ``None`` if neither is usable.
+
+    Both z-scores are carried on every row so either board can be audited from
+    the row alone. Which one is *headline* -- the ``driver`` / ``z_score`` /
+    ``direction`` fields -- is decided later by :func:`rank_by`, because the same
+    city can appear on the temperature board and the humidity board with a
+    different headline on each.
+    """
     z_temperature = z_score(
         observation.temperature_c, normals.mean_temperature_c, normals.sd_temperature_c
     )
@@ -57,19 +64,14 @@ def score_city(city: CityRecord, observation: Observation, normals: Normals) -> 
         observation.humidity_pct, normals.mean_humidity_pct, normals.sd_humidity_pct
     )
 
-    # The board ranks on the strongest single departure, not the average of the
-    # two. Averaging would let a perfectly normal humidity halve a genuine
-    # temperature extreme, hiding exactly the events this exists to surface.
-    if abs(z_temperature) >= abs(z_humidity):
-        headline, driver = z_temperature, "temperature"
-    else:
-        headline, driver = z_humidity, "humidity"
-
-    if headline == 0.0 or abs(headline) > MAX_PLAUSIBLE_Z:
+    # A city needs at least one usable variable to be worth carrying. Each board
+    # applies its own filter afterwards, so a broken humidity sensor cannot
+    # suppress a genuine temperature anomaly at the same city.
+    if not (_usable(z_temperature) or _usable(z_humidity)):
         return None
 
     return AnomalyRow(
-        rank=0,  # assigned by rank_rows once the field is sorted
+        rank=0,  # assigned per board by rank_by
         city=city.name,
         state=city.state,
         country=city.country,
@@ -83,24 +85,52 @@ def score_city(city: CityRecord, observation: Observation, normals: Normals) -> 
         sd_humidity_pct=round(normals.sd_humidity_pct, 2),
         z_temperature=round(z_temperature, 2),
         z_humidity=round(z_humidity, 2),
-        z_score=round(abs(headline), 2),
-        driver=driver,
-        direction="above" if headline > 0 else "below",
+        # Placeholders; rank_by rewrites these for the board it builds.
+        z_score=0.0,
+        driver="temperature",
+        direction="above",
     )
 
 
-def rank_rows(rows: list[tuple[AnomalyRow, CityRecord]], limit: int) -> list[AnomalyRow]:
-    """Order by anomaly magnitude and assign ranks.
+def _usable(z: float) -> bool:
+    """A departure worth ranking: non-zero, and not so large it is likely a fault.
+
+    Real records sit near 4-5 sigma. Beyond ``MAX_PLAUSIBLE_Z`` the likeliest
+    explanation is a station or grid-cell fault, and letting it through would put
+    a broken sensor at the top of the board.
+    """
+    return z != 0.0 and abs(z) <= MAX_PLAUSIBLE_Z
+
+
+def rank_by(
+    rows: list[tuple[AnomalyRow, CityRecord]], driver: Driver, limit: int
+) -> list[AnomalyRow]:
+    """Build one board, ranked on ``driver`` alone.
+
+    Ranking each variable separately rather than on the larger of the two is what
+    keeps both boards populated. A single combined ranking lets whichever
+    variable happens to be having a big day sweep the whole visible top ten --
+    which is not a bug in the maths, but does hide the other half of the weather.
 
     Ties break on population then geonameid so that two sweeps over identical
-    data always produce an identical board -- otherwise the leaderboard would
-    reshuffle between refreshes for no visible reason.
+    data produce an identical board, instead of reshuffling between refreshes.
     """
-    ordered = sorted(
-        rows,
-        key=lambda pair: (-pair[0].z_score, -pair[1].population, pair[1].geonameid),
-    )
+    scored: list[tuple[float, AnomalyRow, CityRecord]] = []
+    for row, city in rows:
+        z = row.z_temperature if driver == "temperature" else row.z_humidity
+        if _usable(z):
+            scored.append((z, row, city))
+
+    scored.sort(key=lambda item: (-abs(item[0]), -item[2].population, item[2].geonameid))
+
     return [
-        row.model_copy(update={"rank": index + 1})
-        for index, (row, _) in enumerate(ordered[:limit])
+        row.model_copy(
+            update={
+                "rank": index + 1,
+                "z_score": round(abs(z), 2),
+                "driver": driver,
+                "direction": "above" if z > 0 else "below",
+            }
+        )
+        for index, (z, row, _) in enumerate(scored[:limit])
     ]

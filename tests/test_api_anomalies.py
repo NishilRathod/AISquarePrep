@@ -43,20 +43,18 @@ def board_app(app, fake_redis, monkeypatch):
     monkeypatch.setattr(
         anomaly_board,
         "load_normals",
-        lambda: NormalsStore(
-            values=values,
-            n_cities=len(cities),
-            window_start="2021-01-01",
-            window_end="2025-12-31",
-            cities_covered=len(cities),
+        lambda: NormalsStore.from_values(
+            values, len(cities), window_start="2021-01-01", window_end="2025-12-31"
         ),
     )
 
+    # Temperature and humidity deliberately rank the cities in opposite orders,
+    # so a board that silently used one variable for both would be obvious.
     readings = [
-        CurrentReading(temperature_c=30.0, humidity_pct=60.0, local_date="2026-06-15"),
-        CurrentReading(temperature_c=28.0, humidity_pct=60.0, local_date="2026-06-15"),
-        CurrentReading(temperature_c=26.0, humidity_pct=60.0, local_date="2026-06-15"),
-        CurrentReading(temperature_c=24.0, humidity_pct=60.0, local_date="2026-06-15"),
+        CurrentReading(temperature_c=30.0, humidity_pct=62.0, local_date="2026-06-15"),
+        CurrentReading(temperature_c=28.0, humidity_pct=65.0, local_date="2026-06-15"),
+        CurrentReading(temperature_c=26.0, humidity_pct=70.0, local_date="2026-06-15"),
+        CurrentReading(temperature_c=24.0, humidity_pct=80.0, local_date="2026-06-15"),
     ]
     service = AnomalyBoardService(fake_redis, StubClient(readings), 50, None)
     app.dependency_overrides[get_anomaly_board_service] = lambda: service
@@ -69,7 +67,8 @@ async def test_cold_start_returns_empty_board_not_an_error(client, board_app):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["rows"] == []
+    assert body["temperature"] == []
+    assert body["humidity"] == []
     assert body["source"] == "unavailable"
     assert body["swept_at"] is None
     assert body["briefing"] is None
@@ -84,16 +83,23 @@ async def test_refresh_then_read_serves_a_ranked_board(client, board_app):
     body = response.json()
 
     assert body["source"] == "fresh"
-    assert [row["city"] for row in body["rows"]] == ["City0", "City1", "City2", "City3"]
-    assert [row["rank"] for row in body["rows"]] == [1, 2, 3, 4]
-    assert body["rows"][0]["z_score"] == 5.0
-    assert body["rows"][0]["driver"] == "temperature"
-    assert body["rows"][0]["direction"] == "above"
+    temperature = body["temperature"]
+    assert [row["city"] for row in temperature] == ["City0", "City1", "City2", "City3"]
+    assert [row["rank"] for row in temperature] == [1, 2, 3, 4]
+    assert temperature[0]["z_score"] == 5.0
+    assert temperature[0]["driver"] == "temperature"
+    assert temperature[0]["direction"] == "above"
+
+    # Humidity ranks the same cities in the opposite order, on its own variable.
+    humidity = body["humidity"]
+    assert [row["city"] for row in humidity] == ["City3", "City2", "City1", "City0"]
+    assert humidity[0]["driver"] == "humidity"
+    assert humidity[0]["z_score"] == 4.0
 
 
 async def test_rows_carry_the_numbers_needed_to_audit_the_ranking(client, board_app):
     await client.post("/anomalies/refresh")
-    row = (await client.get("/anomalies")).json()["rows"][0]
+    row = (await client.get("/anomalies")).json()["temperature"][0]
 
     # (30.0 - 20.0) / 2.0 == 5.0, recomputable from the response alone.
     assert row["temperature_c"] == 30.0
@@ -105,7 +111,9 @@ async def test_rows_carry_the_numbers_needed_to_audit_the_ranking(client, board_
 async def test_limit_is_honoured(client, board_app):
     await client.post("/anomalies/refresh")
     body = (await client.get("/anomalies?limit=2")).json()
-    assert len(body["rows"]) == 2
+    # The limit is per board: asking for two gets two of each, not two in total.
+    assert len(body["temperature"]) == 2
+    assert len(body["humidity"]) == 2
 
 
 @pytest.mark.parametrize("limit", [0, -1, 51])
@@ -119,4 +127,5 @@ async def test_board_serves_without_a_briefing_when_no_key_is_configured(client,
     body = (await client.get("/anomalies")).json()
 
     assert body["briefing"] is None
-    assert len(body["rows"]) == 4
+    assert len(body["temperature"]) == 4
+    assert len(body["humidity"]) == 4

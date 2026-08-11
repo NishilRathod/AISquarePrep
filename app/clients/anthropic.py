@@ -37,10 +37,12 @@ SYSTEM_PROMPT = """\
 You are a meteorologist writing the editorial note for a global weather anomaly \
 board.
 
-The board ranks cities by standardized anomaly (z-score): how many standard \
-deviations today's local daily mean sits from that city's own 5-year normal for \
-this calendar month. Each city's sigma is its own, which is what makes the \
-ranking comparable across very different climates.
+There are two boards, one for temperature and one for humidity, each ranked by \
+standardized anomaly (z-score): how many standard deviations today's local daily \
+mean sits from that city's own multi-year normal for this calendar month. Each \
+city's sigma is its own, which is what makes the ranking comparable across very \
+different climates. The boards are ranked independently, so a city can appear on \
+both -- when it does, treat it as one event.
 
 The ranks and z-scores are established fact. Do not recompute, re-rank, or \
 second-guess them, and do not do arithmetic on them. Your job is the part the \
@@ -76,8 +78,10 @@ class AnomalyBriefingClient:
         self._settings = settings
         self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
-    async def brief(self, rows: list[AnomalyRow]) -> AnomalyBriefing | None:
-        if not rows:
+    async def brief(
+        self, temperature: list[AnomalyRow], humidity: list[AnomalyRow]
+    ) -> AnomalyBriefing | None:
+        if not (temperature or humidity):
             return None
 
         import anthropic
@@ -90,7 +94,9 @@ class AnomalyBriefingClient:
                 thinking={"type": "adaptive"},
                 output_config={"effort": "low"},
                 output_format=AnomalyBriefing,
-                messages=[{"role": "user", "content": self._render(rows)}],
+                messages=[
+                    {"role": "user", "content": self._render(temperature, humidity)}
+                ],
             )
         except anthropic.APIError as exc:
             logger.warning("Anomaly briefing unavailable: %s", exc)
@@ -105,35 +111,41 @@ class AnomalyBriefingClient:
 
         return response.parsed_output
 
-    @staticmethod
-    def _render(rows: list[AnomalyRow]) -> str:
-        """Serialize the board as compact JSON.
+    @classmethod
+    def _render(cls, temperature: list[AnomalyRow], humidity: list[AnomalyRow]) -> str:
+        """Serialize both boards as compact JSON.
 
         Coordinates are included because the grouping task is geographic --
-        without them the model can only rely on recalling where cities are.
+        without them the model can only rely on recalling where cities are. Both
+        boards go in one message so a city appearing on each can be recognised as
+        one event rather than two.
         """
-        payload = [
-            {
-                "rank": row.rank,
-                "city": row.city,
-                "state": row.state,
-                "country": row.country,
-                "lat": row.latitude,
-                "lon": row.longitude,
-                "temperature_c": row.temperature_c,
-                "normal_temperature_c": row.normal_temperature_c,
-                "humidity_pct": row.humidity_pct,
-                "normal_humidity_pct": row.normal_humidity_pct,
-                "z_temperature": row.z_temperature,
-                "z_humidity": row.z_humidity,
-                "z_score": row.z_score,
-                "driver": row.driver,
-                "direction": row.direction,
-            }
-            for row in rows
-        ]
         return (
-            "Today's anomaly board, already ranked. Each row is one city's local "
-            "daily mean against its own normal for this month.\n\n"
-            + json.dumps(payload, ensure_ascii=False)
+            "Today's anomaly boards, already ranked. Each row is one city's local "
+            "daily mean against its own normal for this calendar month. The two "
+            "boards are ranked independently, so a city may appear on both -- if "
+            "it does, that is one event, not two.\n\n"
+            "TEMPERATURE:\n"
+            + json.dumps([cls._row(r) for r in temperature], ensure_ascii=False)
+            + "\n\nHUMIDITY:\n"
+            + json.dumps([cls._row(r) for r in humidity], ensure_ascii=False)
         )
+
+    @staticmethod
+    def _row(row: AnomalyRow) -> dict:
+        return {
+            "rank": row.rank,
+            "city": row.city,
+            "state": row.state,
+            "country": row.country,
+            "lat": row.latitude,
+            "lon": row.longitude,
+            "temperature_c": row.temperature_c,
+            "normal_temperature_c": row.normal_temperature_c,
+            "humidity_pct": row.humidity_pct,
+            "normal_humidity_pct": row.normal_humidity_pct,
+            "z_temperature": row.z_temperature,
+            "z_humidity": row.z_humidity,
+            "z_score": row.z_score,
+            "direction": row.direction,
+        }
