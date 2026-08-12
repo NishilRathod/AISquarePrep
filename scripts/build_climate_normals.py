@@ -440,6 +440,7 @@ def build(
     started = time.time()
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     done_count = 0
+    cached_this_run = 0
     exhausted = False
     with CACHE_PATH.open("a", encoding="utf-8") as handle:
         for missing, group_cities in groups.items():
@@ -492,6 +493,7 @@ def build(
                         if year in wanted:
                             append_year(handle, city.geonameid, year, blob)
                             cache.setdefault(city.geonameid, {})[year] = blob
+                            cached_this_run += 1
                 handle.flush()
 
                 done_count += len(batch)
@@ -514,6 +516,17 @@ def build(
     print(f"\nsettled pacing rate: {pacer.rate:.0f} location-years/min")
     print(f"  pass --rate {pacer.rate:.0f} on the next run to start there")
 
+    if not cached_this_run:
+        # Repacking from an unchanged cache cannot improve the artefact and can
+        # destroy it: a run that gets no quota at all would overwrite a good
+        # baseline with all-NaN and blank the board until the next successful
+        # fetch. Since this loop is meant to be re-run unattended, that would
+        # happen every time the daily allowance is already spent.
+        print("\nno new city-years cached; leaving the artefact as it is")
+        print("  pack explicitly with --write-only if that is what you want")
+        return
+
+    print(f"\ncached {cached_this_run:,} new city-years")
     _write_artifact(cities, cache, years, statistic)
 
 

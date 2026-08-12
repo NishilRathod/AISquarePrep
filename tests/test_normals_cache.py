@@ -360,6 +360,48 @@ class TestDailyQuotaEndsTheRun:
         assert calls["n"] > 1  # it did retry
 
 
+class TestPackingIsEarned:
+    """A run that fetched nothing must not rewrite the artefact.
+
+    Repacking from an empty or unchanged cache cannot improve the artefact and
+    can destroy it: a quota-exhausted run would overwrite a good baseline with
+    all-NaN, blanking the board until the next successful fetch. Observed
+    exactly that way -- a run that got zero cities replaced 520 with none.
+    """
+
+    def test_a_run_that_cached_nothing_leaves_the_artefact_alone(self, monkeypatch, tmp_path):
+        import scripts.build_climate_normals as script
+
+        artefact = tmp_path / "n.bin.gz"
+        artefact.write_bytes(b"previous")
+        monkeypatch.setattr(script, "NORMALS_PATH", artefact)
+        monkeypatch.setattr(script, "META_PATH", tmp_path / "n.meta.json")
+        monkeypatch.setattr(script, "CACHE_PATH", tmp_path / "cache.jsonl")
+        monkeypatch.setattr(script, "_select_cities", lambda *a: [_city(1)])
+        monkeypatch.setattr(script, "city_records", lambda: [_city(1)])
+
+        def exhausted(*args, **kwargs):
+            raise script.DailyQuotaExhausted("Daily API request limit exceeded.")
+
+        monkeypatch.setattr(script, "_fetch_batch", exhausted)
+
+        script.build(None, 0, 1, 200, 1.0, 60.0, "mean-sd")
+
+        assert artefact.read_bytes() == b"previous"
+
+    def test_write_only_packs_regardless(self, tmp_path, monkeypatch):
+        """--write-only exists to repack on demand; it must not second-guess that."""
+        import scripts.build_climate_normals as script
+
+        monkeypatch.setattr(script, "NORMALS_PATH", tmp_path / "n.bin.gz")
+        monkeypatch.setattr(script, "META_PATH", tmp_path / "n.meta.json")
+        monkeypatch.setattr(script, "city_records", lambda: [_city(1)])
+
+        script._write_artifact([_city(1)], {}, [2023], "mean-sd")
+
+        assert (tmp_path / "n.bin.gz").exists()
+
+
 class TestArtefactFromCache:
     """The artefact spans the whole index positionally, however few cities were fetched."""
 
