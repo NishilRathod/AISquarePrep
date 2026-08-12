@@ -244,3 +244,104 @@ class TestCacheIO:
 
     def test_cached_years_reports_what_is_held(self):
         assert cached_years({7: {2023: "x", 2024: "y"}}, 7) == {2023, 2024}
+
+
+def _city(geonameid):
+    from app.services.city_index import CityRecord
+
+    return CityRecord(
+        row_index=geonameid,
+        geonameid=geonameid,
+        name=f"C{geonameid}",
+        state="",
+        country="XX",
+        population=1,
+        latitude=0.0,
+        longitude=0.0,
+    )
+
+
+class TestMissingYearGrouping:
+    """Resume is per city-year, so a run asks only for the gaps it actually has."""
+
+    def test_a_fresh_run_is_one_group_wanting_everything(self):
+        from scripts.build_climate_normals import group_by_missing_years
+
+        groups = group_by_missing_years([_city(1), _city(2)], {}, [2023, 2024, 2025])
+        assert groups == {(2023, 2024, 2025): [_city(1), _city(2)]}
+
+    def test_a_fully_cached_city_is_absent(self):
+        from scripts.build_climate_normals import group_by_missing_years
+
+        cache = {1: {2023: "a", 2024: "b", 2025: "c"}}
+        assert group_by_missing_years([_city(1)], cache, [2023, 2024, 2025]) == {}
+
+    def test_a_partly_cached_city_asks_only_for_its_gaps(self):
+        from scripts.build_climate_normals import group_by_missing_years
+
+        groups = group_by_missing_years([_city(1)], {1: {2023: "a"}}, [2023, 2024, 2025])
+        assert list(groups) == [(2024, 2025)]
+
+    def test_cities_wanting_the_same_years_share_a_group(self):
+        from scripts.build_climate_normals import group_by_missing_years
+
+        cache = {1: {2023: "a"}, 2: {2023: "a"}}
+        groups = group_by_missing_years(
+            [_city(1), _city(2), _city(3)], cache, [2023, 2024, 2025]
+        )
+
+        assert len(groups[(2024, 2025)]) == 2
+        assert len(groups[(2023, 2024, 2025)]) == 1
+
+
+class TestArtefactFromCache:
+    """The artefact spans the whole index positionally, however few cities were fetched."""
+
+    def _patch(self, tmp_path, monkeypatch, index):
+        import scripts.build_climate_normals as script
+
+        monkeypatch.setattr(script, "NORMALS_PATH", tmp_path / "n.bin.gz")
+        monkeypatch.setattr(script, "META_PATH", tmp_path / "n.meta.json")
+        monkeypatch.setattr(script, "city_records", lambda: index)
+        return script
+
+    def _packed(self, tmp_path):
+        import gzip
+        from array import array
+
+        values = array("f")
+        with gzip.open(tmp_path / "n.bin.gz", "rb") as handle:
+            values.frombytes(handle.read())
+        return values
+
+    def test_meta_records_which_statistic_produced_it(self, tmp_path, monkeypatch):
+        import json as json_module
+
+        script = self._patch(tmp_path, monkeypatch, [_city(1)])
+        script._write_artifact([_city(1)], {1: {}}, [2023], "median-mad")
+
+        meta = json_module.loads((tmp_path / "n.meta.json").read_text(encoding="utf-8"))
+        assert meta["statistic"] == "median-mad"
+        assert meta["cache_version"] == 2
+        assert meta["window_start"] == "2023-01-01"
+        assert meta["window_end"] == "2023-12-31"
+
+    def test_a_city_with_no_cached_years_is_all_missing_not_zero(self, tmp_path, monkeypatch):
+        """Absent from the board beats wrong on it."""
+        script = self._patch(tmp_path, monkeypatch, [_city(1)])
+        script._write_artifact([_city(1)], {}, [2023], "mean-sd")
+
+        values = self._packed(tmp_path)
+        assert len(values) == 48
+        assert all(math.isnan(value) for value in values)
+
+    def test_an_uncovered_city_does_not_shift_its_neighbour(self, tmp_path, monkeypatch):
+        """Rows are positional, so a gap must be padded rather than skipped."""
+        script = self._patch(tmp_path, monkeypatch, [_city(1), _city(2)])
+        cache = {2: split_response_by_year(_response(2023, 1))}
+        script._write_artifact([_city(1), _city(2)], cache, [2023], "mean-sd")
+
+        values = self._packed(tmp_path)
+        assert len(values) == 96
+        assert math.isnan(values[0])  # city 1, never fetched
+        assert values[48] == pytest.approx(10.0, abs=0.05)  # city 2, January mean

@@ -8,8 +8,15 @@ that city, that variable, that time of year.
     z = (observed - mean) / sd
 
 This script fetches daily reanalysis history from Open-Meteo (ERA5, free, no API
-key) and reduces it to, per city and per calendar month, the mean and standard
-deviation of daily mean temperature and daily mean relative humidity.
+key) into the cache in :mod:`scripts.normals_cache`, then reduces it to, per city
+and per calendar month, the mean and standard deviation of daily mean temperature
+and daily mean relative humidity.
+
+The fetch and the reduction are deliberately separate. The cache holds the daily
+values the API returned, so --years and --statistic are pack-time choices that
+can be changed by re-running with --write-only, at no quota cost. Only the fetch
+spends quota, and it only ever asks for city-years the cache does not already
+hold.
 
 Why sigma is over *daily* values within a calendar month, pooled across years,
 rather than over monthly means: the question the board asks is "how unusual is
@@ -18,20 +25,25 @@ reading is drawn from. Sigma of monthly means answers a different question ("how
 unusual is this month overall") and is far too small, which would make almost
 every day look extreme.
 
-Five years rather than the WMO 30-year standard is a deliberate trade. It is a
-sixth of the fetch volume, and ~150 daily samples per city-month already puts the
-error on sigma near 6%; the mean drifts slightly warm relative to a 1961-1990
-baseline, which matters for climate-change attribution but not for "is today
-unusual for this place". --years 3 halves the fetch again at some cost to that
-stability, but note it starts a new window and therefore a new checkpoint.
+A few years rather than the WMO 30-year standard is a deliberate trade. The
+default of 3 gives ~90 daily samples per city-month; 5 gives ~150 and puts the
+error on sigma near 6%. The shorter window is cheaper to fetch but concentrates
+the influence of any single extreme event inside it -- a heat dome in the
+baseline inflates that city-month's sigma, which widens the band future
+anomalies are measured against and pushes real events down the board.
+--statistic median-mad exists for exactly that, and because the cache holds the
+daily values, widening the window later fetches only the years it lacks rather
+than starting over.
 
 Rate limits are the binding constraint, and they are a *quota* rather than a
 throughput cap: Open-Meteo weights its allowance by locations x days, not by
 request count, so batching reduces transfer overhead but buys no extra quota.
-There are separate minutely, hourly, and daily windows; measured against the
-archive endpoint, the **hourly** one binds first, and it is easy to exhaust in a
-few minutes of enthusiastic requests and then be locked out for the rest of the
-hour.
+There are separate minutely, hourly, and daily windows. All three were observed
+in one afternoon, but the **daily** one is what actually ends a run -- "Daily
+API request limit exceeded. Please try again tomorrow." The hourly limit costs
+an hour; the daily limit costs the rest of the day, which is why a full-index
+build is measured in weeks rather than hours and why the script no longer prints
+a completion estimate derived from its pacing rate.
 
 That makes pacing, not batch size, the thing that matters. Firing large requests
 as fast as possible is the worst available strategy: each trips the limit, backs
@@ -59,11 +71,16 @@ Coverage is partial-friendly at every stage -- cities not yet fetched are NaN an
 simply absent from the board rather than wrong on it -- so a long run can be
 stopped, packed with --write-only, and resumed later.
 
-    # the default: cities over 100k, a working global board
+    # the default: cities over 100k across 3 years, a working global board
     python scripts/build_climate_normals.py
 
-    # the whole index; expect a day or more, re-run to resume
+    # the whole index; expect weeks of daily quota, re-run to resume
     python scripts/build_climate_normals.py --min-population 0
+
+    # repack what is already cached over a longer window, or a robust
+    # statistic -- neither spends any quota
+    python scripts/build_climate_normals.py --write-only --years 5
+    python scripts/build_climate_normals.py --write-only --statistic median-mad
 
 Data: Open-Meteo ERA5 reanalysis, CC BY 4.0 -- see app/data/ATTRIBUTION.md.
 """
@@ -87,6 +104,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.services.city_index import CityRecord, city_records  # noqa: E402
+from scripts.normals_cache import (  # noqa: E402
+    CACHE_PATH,
+    MIN_SAMPLES,
+    MISSING,
+    MONTHS,
+    STATS,
+    append_year,
+    cached_years,
+    compose,
+    load_cache,
+    split_response_by_year,
+)
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
@@ -94,10 +123,6 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "app" / "data"
 NORMALS_PATH = DATA_DIR / "climate_normals.bin.gz"
 META_PATH = DATA_DIR / "climate_normals.meta.json"
 
-
-MONTHS = 12
-# Per city-month we store: mean temp, sd temp, mean humidity, sd humidity.
-STATS = 4
 
 # Coordinates go in the query string, and the server rejects a URI over 8 KB with
 # a 414 -- measured: 500 cities is 8,291 characters and fails, 250 is 4,219 and
@@ -118,26 +143,6 @@ MAX_URL_CHARS = 7_000
 # transfer overhead. Undershooting is therefore the cheap error and overshooting
 # loses the whole batch, so take the conservative number.
 MAX_LOCATION_DAYS = 200_000
-
-# Sentinel written for a city-month with too little data to characterise. NaN
-# rather than 0.0 so a missing baseline can never masquerade as a real one --
-# scoring skips these instead of reporting a spurious anomaly.
-MISSING = float("nan")
-
-# Below this many daily samples a standard deviation is not worth trusting.
-MIN_SAMPLES = 20
-
-
-def _checkpoint_path(start: str, end: str) -> Path:
-    """Checkpoints are per-window.
-
-    Resuming is keyed on "have we already done this city", so a checkpoint from
-    a different date range would silently satisfy that check and mix baselines
-    computed over different periods into one artefact. Putting the window in the
-    filename makes that impossible rather than merely unlikely.
-    """
-    return DATA_DIR / f".climate_normals.{start}_{end}.checkpoint.jsonl"
-
 
 class RateLimited(Exception):
     """Open-Meteo returned 429; the caller should back off and retry."""
@@ -298,80 +303,6 @@ def _fetch_batch(
     return None, throttled
 
 
-def _accumulate(daily: dict) -> list[list[float]]:
-    """Reduce one city's daily series to per-month running sums.
-
-    Returns 12 rows of ``[n_t, sum_t, sumsq_t, n_h, sum_h, sumsq_h]``. Sums
-    rather than retained samples because the whole point is to never hold ten
-    years of daily values for 34k cities in memory at once.
-    """
-    months = [[0.0] * 6 for _ in range(MONTHS)]
-
-    times = daily.get("time") or []
-    temps = daily.get("temperature_2m_mean") or []
-    humidities = daily.get("relative_humidity_2m_mean") or []
-
-    for index, stamp in enumerate(times):
-        # "YYYY-MM-DD" -> 0-based month. Cheaper than parsing a date, and the
-        # archive API's format is fixed.
-        try:
-            month = int(stamp[5:7]) - 1
-        except (ValueError, IndexError):
-            continue
-        if not 0 <= month < MONTHS:
-            continue
-        bucket = months[month]
-
-        temp = temps[index] if index < len(temps) else None
-        if temp is not None:
-            bucket[0] += 1
-            bucket[1] += temp
-            bucket[2] += temp * temp
-
-        humidity = humidities[index] if index < len(humidities) else None
-        if humidity is not None:
-            bucket[3] += 1
-            bucket[4] += humidity
-            bucket[5] += humidity * humidity
-
-    return months
-
-
-def _finalize(months: list[list[float]]) -> list[float]:
-    """Turn running sums into ``[mean_t, sd_t, mean_h, sd_h]`` per month."""
-    out: list[float] = []
-    for bucket in months:
-        pairs = ((bucket[0], bucket[1], bucket[2]), (bucket[3], bucket[4], bucket[5]))
-        for count, total, total_sq in pairs:
-            if count < MIN_SAMPLES:
-                out.extend((MISSING, MISSING))
-                continue
-            mean = total / count
-            # Sample variance; clamped because catastrophic cancellation in the
-            # sum-of-squares form can land a hair below zero on a near-constant
-            # month.
-            variance = max((total_sq - count * mean * mean) / (count - 1), 0.0)
-            out.extend((mean, math.sqrt(variance)))
-    return out
-
-
-def _load_checkpoint(path: Path) -> dict[int, list[float]]:
-    if not path.exists():
-        return {}
-    done: dict[int, list[float]] = {}
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-                done[int(record["id"])] = record["v"]
-            except (ValueError, KeyError):
-                continue  # truncated final line from an interrupted run
-    return done
-
-
 def _geonameid_digest(cities: list[CityRecord]) -> str:
     joined = ",".join(str(city.geonameid) for city in cities)
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
@@ -428,97 +359,132 @@ def _select_cities(city_limit: int | None, min_population: int) -> list[CityReco
     return cities
 
 
+def group_by_missing_years(
+    cities: list[CityRecord], cache: dict[int, dict[int, str]], years: list[int]
+) -> dict[tuple[int, ...], list[CityRecord]]:
+    """Bucket cities by which years they still lack.
+
+    A fresh run is one bucket wanting the whole window, and a widened window is
+    also one bucket, wanting only the years added. Grouping keeps the request
+    shape uniform in both cases while letting a city interrupted mid-window keep
+    the years it already received instead of starting over.
+    """
+    groups: dict[tuple[int, ...], list[CityRecord]] = {}
+    for city in cities:
+        missing = tuple(sorted(set(years) - cached_years(cache, city.geonameid)))
+        if missing:
+            groups.setdefault(missing, []).append(city)
+    return groups
+
+
 def build(
     city_limit: int | None,
     min_population: int,
-    years: int,
+    years_wanted: int,
     batch_size: int,
     timeout: float,
     rate: float,
+    statistic: str,
 ) -> None:
     cities = _select_cities(city_limit, min_population)
 
     end_year = datetime.now(UTC).year - 1
-    start = f"{end_year - years + 1}-01-01"
-    end = f"{end_year}-12-31"
+    years = list(range(end_year - years_wanted + 1, end_year + 1))
 
-    checkpoint_path = _checkpoint_path(start, end)
-    done = _load_checkpoint(checkpoint_path)
-    pending = [city for city in cities if city.geonameid not in done]
+    cache = load_cache(CACHE_PATH)
+    groups = group_by_missing_years(cities, cache, years)
+    pending = sum(len(group) for group in groups.values())
 
     pacer = Pacer(rate)
 
-    print(f"cities={len(cities):,} window={start}..{end}")
-    print(f"already checkpointed={len(done):,} remaining={len(pending):,}")
+    print(f"cities={len(cities):,} window={years[0]}..{years[-1]} statistic={statistic}")
+    print(f"already cached={len(cities) - pending:,} remaining={pending:,}")
     if pending:
         print(f"starting at {rate:.0f} location-years/min, adapting from there")
-        print(f"~{len(pending) * years / rate / 60:.1f}h remaining at the starting rate\n")
+        # No completion estimate. Open-Meteo's *daily* quota binds long before
+        # the pacing rate does -- a run ends because the API says "try again
+        # tomorrow", not because of how fast it asked -- so any hours figure
+        # derived from the rate alone understates the wall clock by more than an
+        # order of magnitude. It used to promise 46 hours for a job measured in
+        # weeks.
+        print("runs until the daily quota is exhausted; re-run to resume\n")
 
     started = time.time()
-    with checkpoint_path.open("a", encoding="utf-8") as checkpoint:
-        chunks: list[list[CityRecord]] = []
-        for offset in range(0, len(pending), batch_size):
-            chunks.extend(split_to_limits(pending[offset : offset + batch_size], start, end))
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    done_count = 0
+    with CACHE_PATH.open("a", encoding="utf-8") as handle:
+        for missing, group_cities in groups.items():
+            start = f"{missing[0]}-01-01"
+            end = f"{missing[-1]}-12-31"
+            wanted = set(missing)
 
-        done_count = 0
-        for chunk_index, batch in enumerate(chunks):
-            batch_started = time.time()
-            results, throttled = _fetch_batch(batch, start, end, timeout=timeout)
+            chunks: list[list[CityRecord]] = []
+            for offset in range(0, len(group_cities), batch_size):
+                chunks.extend(
+                    split_to_limits(group_cities[offset : offset + batch_size], start, end)
+                )
 
-            if throttled:
-                pacer.on_throttled()
-            else:
-                pacer.on_success()
+            for chunk_index, batch in enumerate(chunks):
+                batch_started = time.time()
+                results, throttled = _fetch_batch(batch, start, end, timeout=timeout)
 
-            if results is None:
-                continue
+                if throttled:
+                    pacer.on_throttled()
+                else:
+                    pacer.on_success()
 
-            # Cities are matched to results by position, so a short or long
-            # response would shift every city onto its neighbour's climate --
-            # wrong in a way nothing downstream could detect. Drop the batch.
-            if len(results) != len(batch):
+                if results is None:
+                    continue
+
+                # Cities are matched to results by position, so a short or long
+                # response would shift every city onto its neighbour's climate --
+                # wrong in a way nothing downstream could detect. Drop the batch.
+                if len(results) != len(batch):
+                    print(
+                        f"    length mismatch: sent {len(batch)}, "
+                        f"got {len(results)} -- batch dropped",
+                        flush=True,
+                    )
+                    continue
+
+                for city, result in zip(batch, results, strict=True):
+                    daily = result.get("daily") if isinstance(result, dict) else None
+                    if not daily:
+                        continue
+                    for year, blob in split_response_by_year(daily).items():
+                        if year in wanted:
+                            append_year(handle, city.geonameid, year, blob)
+                            cache.setdefault(city.geonameid, {})[year] = blob
+                handle.flush()
+
+                done_count += len(batch)
+                elapsed = time.time() - started
+                observed = done_count / elapsed if elapsed else 0
                 print(
-                    f"    length mismatch: sent {len(batch)}, got {len(results)} -- batch dropped",
+                    f"  {done_count:>6,}/{pending:,} cities  "
+                    f"{observed * 60:>5.0f} cities/min  "
+                    f"pace {pacer.rate:>4.0f} loc-yr/min",
                     flush=True,
                 )
-                continue
 
-            for city, result in zip(batch, results, strict=True):
-                daily = result.get("daily") if isinstance(result, dict) else None
-                if not daily:
-                    continue
-                values = _finalize(_accumulate(daily))
-                checkpoint.write(json.dumps({"id": city.geonameid, "v": values}) + "\n")
-                done[city.geonameid] = values
-            checkpoint.flush()
-
-            done_count += len(batch)
-            complete = done_count
-            elapsed = time.time() - started
-            observed = complete / elapsed if elapsed else 0
-            eta = (len(pending) - complete) / observed / 60 if observed else 0
-            print(
-                f"  {complete:>6,}/{len(pending):,} cities  "
-                f"{observed * 60:>5.0f} cities/min  "
-                f"pace {pacer.rate:>4.0f} loc-yr/min  eta {eta:>5.1f}m",
-                flush=True,
-            )
-
-            if chunk_index + 1 < len(chunks):
-                remaining = pacer.seconds_between(len(batch) * years) - (
-                    time.time() - batch_started
-                )
-                if remaining > 0:
-                    time.sleep(remaining)
+                if chunk_index + 1 < len(chunks):
+                    remaining = pacer.seconds_between(len(batch) * len(missing)) - (
+                        time.time() - batch_started
+                    )
+                    if remaining > 0:
+                        time.sleep(remaining)
 
     print(f"\nsettled pacing rate: {pacer.rate:.0f} location-years/min")
     print(f"  pass --rate {pacer.rate:.0f} on the next run to start there")
 
-    _write_artifact(cities, done, start, end, years)
+    _write_artifact(cities, cache, years, statistic)
 
 
 def _write_artifact(
-    _selected: list[CityRecord], done: dict[int, list[float]], start: str, end: str, years: int
+    _selected: list[CityRecord],
+    cache: dict[int, dict[int, str]],
+    years: list[int],
+    statistic: str,
 ) -> None:
     """Write the packed array over the **whole** city index, in index order.
 
@@ -534,15 +500,22 @@ def _write_artifact(
     correspondence exact.
     """
     cities = city_records()
+    start = f"{years[0]}-01-01"
+    end = f"{years[-1]}-12-31"
 
     flat = array("f")
     covered = 0
     for city in cities:
-        values = done.get(city.geonameid)
-        if values is None:
+        year_blobs = cache.get(city.geonameid)
+        if not year_blobs:
             flat.extend([MISSING] * (MONTHS * STATS))
-        else:
-            flat.extend(values)
+            continue
+        # Composed here rather than at fetch time: the cache holds the daily
+        # values, so the window and the statistic are chosen at pack time and
+        # can be changed by repacking, without spending any quota.
+        values = compose(year_blobs, years, statistic)
+        flat.extend(values)
+        if not all(math.isnan(value) for value in values):
             covered += 1
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -563,7 +536,11 @@ def _write_artifact(
         "cities_covered": covered,
         "window_start": start,
         "window_end": end,
-        "years": years,
+        "years": len(years),
+        # Which reducer produced these numbers. The cache holds the daily
+        # values either way, so this is a property of the pack, not the fetch.
+        "statistic": statistic,
+        "cache_version": 2,
         "min_samples": MIN_SAMPLES,
         # Guards against the city index being rebuilt without this artefact.
         # Positional joins are silent when they go wrong, so this has to fail loud.
@@ -596,7 +573,28 @@ def main() -> None:
             "Pass 0 for the whole 33,957-city index."
         ),
     )
-    parser.add_argument("--years", type=int, default=10, help="years of history (default: 10)")
+    parser.add_argument(
+        "--years",
+        type=int,
+        default=3,
+        help=(
+            "years of history (default: 3). Cheap to change: the cache holds the "
+            "daily values, so a longer window fetches only the years it does not "
+            "already have and a shorter one costs nothing at all."
+        ),
+    )
+    parser.add_argument(
+        "--statistic",
+        choices=("mean-sd", "median-mad"),
+        default="mean-sd",
+        help=(
+            "how each city-month is summarised (default: mean-sd, the plain "
+            "arithmetic baseline). median-mad resists a single extreme event in "
+            "the window inflating sigma, which is how a past heat dome ends up "
+            "suppressing a future real anomaly. Switching is a --write-only "
+            "repack and costs no quota."
+        ),
+    )
     parser.add_argument(
         "--batch",
         type=int,
@@ -622,17 +620,19 @@ def main() -> None:
     parser.add_argument(
         "--write-only",
         action="store_true",
-        help="skip fetching and just pack whatever the checkpoint already holds",
+        help=(
+            "skip fetching and just pack whatever the cache already holds. This is "
+            "how --years and --statistic are changed after the fact: both are pack-"
+            "time choices over cached daily values, so neither spends any quota."
+        ),
     )
     args = parser.parse_args()
 
     if args.write_only:
         cities = _select_cities(args.cities, args.min_population)
         end_year = datetime.now(UTC).year - 1
-        start = f"{end_year - args.years + 1}-01-01"
-        end = f"{end_year}-12-31"
-        checkpoint = _load_checkpoint(_checkpoint_path(start, end))
-        _write_artifact(cities, checkpoint, start, end, args.years)
+        years = list(range(end_year - args.years + 1, end_year + 1))
+        _write_artifact(cities, load_cache(CACHE_PATH), years, args.statistic)
         return
 
     build(
@@ -642,6 +642,7 @@ def main() -> None:
         args.batch,
         args.timeout,
         args.rate,
+        args.statistic,
     )
 
 
