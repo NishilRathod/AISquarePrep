@@ -129,6 +129,15 @@ class RateLimited(Exception):
     """Open-Meteo returned 429; the caller should back off and retry."""
 
 
+class ArchiveError(Exception):
+    """A non-429 HTTP error, carrying the reason Open-Meteo put in the body."""
+
+    def __init__(self, code: int, reason: str | None):
+        self.code = code
+        self.reason = reason
+        super().__init__(f"HTTP {code}: {reason or 'no reason given'}")
+
+
 def _fetch(url: str, *, timeout: float) -> object:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
@@ -136,7 +145,24 @@ def _fetch(url: str, *, timeout: float) -> object:
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
             raise RateLimited from exc
-        raise
+        # Open-Meteo explains itself in the body -- {"error": true, "reason": ...}
+        # -- and urllib puts none of that in the exception's str(), so a bare
+        # HTTPError reads as "400: Bad Request" and says nothing about which
+        # parameter the server objected to. Attach the reason so a failing run
+        # is diagnosable from its log instead of needing a separate probe.
+        reason = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001, S110
+            body = ""
+        if body:
+            try:
+                parsed = json.loads(body)
+                reason = parsed.get("reason") if isinstance(parsed, dict) else None
+            except ValueError:
+                reason = None
+            reason = reason or body[:200]
+        raise ArchiveError(exc.code, reason) from exc
 
 
 def _batch_url(batch: list[CityRecord], start: str, end: str) -> str:
@@ -206,7 +232,7 @@ def _fetch_batch(
             time.sleep(delay)
             delay = min(delay * 1.5, 600.0)
             continue
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (ArchiveError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             if attempt == 5:
                 print(f"    giving up on batch: {type(exc).__name__} {exc}", flush=True)
                 return None, throttled
