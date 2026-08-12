@@ -294,6 +294,72 @@ class TestMissingYearGrouping:
         assert len(groups[(2023, 2024, 2025)]) == 1
 
 
+class TestDailyQuotaEndsTheRun:
+    """The three rate limits are not interchangeable.
+
+    A minutely or hourly refusal is worth waiting out inside the run. A daily
+    one is not: nothing will succeed again until tomorrow, so backing off and
+    retrying every remaining chunk burns hours to accomplish nothing. The run
+    has to end promptly so the artefact gets packed and the next run can resume.
+    """
+
+    def test_daily_exhaustion_is_recognised(self):
+        from scripts.build_climate_normals import is_daily_exhaustion
+
+        assert is_daily_exhaustion(
+            "Daily API request limit exceeded. Please try again tomorrow."
+        )
+
+    def test_shorter_windows_are_not_daily_exhaustion(self):
+        from scripts.build_climate_normals import is_daily_exhaustion
+
+        assert not is_daily_exhaustion(
+            "Hourly API request limit exceeded. Please try again in the next hour."
+        )
+        assert not is_daily_exhaustion(
+            "Minutely API request limit exceeded. Please try again in one minute."
+        )
+        assert not is_daily_exhaustion(None)
+
+    def test_a_daily_refusal_aborts_instead_of_retrying(self, monkeypatch):
+        import scripts.build_climate_normals as script
+
+        calls = {"n": 0, "slept": 0.0}
+
+        def refuse(url, *, timeout):
+            calls["n"] += 1
+            raise script.RateLimited("Daily API request limit exceeded.")
+
+        monkeypatch.setattr(script, "_fetch", refuse)
+        monkeypatch.setattr(script.time, "sleep", lambda s: calls.__setitem__("slept", s))
+
+        with pytest.raises(script.DailyQuotaExhausted):
+            script._fetch_batch([_city(1)], "2023-01-01", "2023-12-31", timeout=1.0)
+
+        assert calls["n"] == 1  # no retry
+        assert calls["slept"] == 0.0  # no backoff
+
+    def test_an_hourly_refusal_still_backs_off_and_retries(self, monkeypatch):
+        import scripts.build_climate_normals as script
+
+        calls = {"n": 0}
+
+        def refuse(url, *, timeout):
+            calls["n"] += 1
+            raise script.RateLimited("Hourly API request limit exceeded.")
+
+        monkeypatch.setattr(script, "_fetch", refuse)
+        monkeypatch.setattr(script.time, "sleep", lambda _s: None)
+
+        results, throttled = script._fetch_batch(
+            [_city(1)], "2023-01-01", "2023-12-31", timeout=1.0
+        )
+
+        assert results is None
+        assert throttled is True
+        assert calls["n"] > 1  # it did retry
+
+
 class TestArtefactFromCache:
     """The artefact spans the whole index positionally, however few cities were fetched."""
 

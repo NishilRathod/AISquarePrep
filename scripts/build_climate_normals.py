@@ -148,6 +148,23 @@ class RateLimited(Exception):
     """Open-Meteo returned 429; the caller should back off and retry."""
 
 
+class DailyQuotaExhausted(Exception):
+    """The day's allowance is gone, so nothing will succeed until it resets.
+
+    Distinguished from :class:`RateLimited` because the right response is the
+    opposite one. A minutely or hourly refusal is worth waiting out inside the
+    run. A daily refusal is not: every remaining chunk would take six attempts
+    and up to ten minutes of backoff to arrive at the same answer, turning a
+    finished run into hours of grinding. Ending promptly gets the artefact
+    packed and lets the next run resume from the cache.
+    """
+
+
+def is_daily_exhaustion(reason: str | None) -> bool:
+    """Whether a 429's reason names the daily window rather than a shorter one."""
+    return bool(reason) and "daily" in reason.lower()
+
+
 class ArchiveError(Exception):
     """A non-429 HTTP error, carrying the reason Open-Meteo put in the body."""
 
@@ -163,25 +180,31 @@ def _fetch(url: str, *, timeout: float) -> object:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
-            raise RateLimited from exc
-        # Open-Meteo explains itself in the body -- {"error": true, "reason": ...}
-        # -- and urllib puts none of that in the exception's str(), so a bare
-        # HTTPError reads as "400: Bad Request" and says nothing about which
-        # parameter the server objected to. Attach the reason so a failing run
-        # is diagnosable from its log instead of needing a separate probe.
-        reason = ""
-        try:
-            body = exc.read().decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001, S110
-            body = ""
-        if body:
-            try:
-                parsed = json.loads(body)
-                reason = parsed.get("reason") if isinstance(parsed, dict) else None
-            except ValueError:
-                reason = None
-            reason = reason or body[:200]
-        raise ArchiveError(exc.code, reason) from exc
+            # The reason distinguishes the minutely, hourly, and daily windows,
+            # which need opposite responses -- wait it out, or stop for today.
+            raise RateLimited(_reason_of(exc)) from exc
+        raise ArchiveError(exc.code, _reason_of(exc)) from exc
+
+
+def _reason_of(exc: urllib.error.HTTPError) -> str | None:
+    """The explanation Open-Meteo put in the body.
+
+    urllib puts none of it in the exception's ``str()``, so a bare HTTPError
+    reads as "400: Bad Request" and says nothing about which parameter the
+    server objected to, or which of the three rate-limit windows was hit.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+    if not body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return body[:200]
+    reason = parsed.get("reason") if isinstance(parsed, dict) else None
+    return reason or body[:200]
 
 
 def _batch_url(batch: list[CityRecord], start: str, end: str) -> str:
@@ -274,7 +297,12 @@ def _fetch_batch(
     for attempt in range(6):
         try:
             payload = _fetch(url, timeout=timeout)
-        except RateLimited:
+        except RateLimited as exc:
+            reason = str(exc) or None
+            if is_daily_exhaustion(reason):
+                # Retrying costs six attempts and ten minutes of backoff per
+                # remaining chunk to learn what this one already told us.
+                raise DailyQuotaExhausted(reason) from exc
             throttled = True
             # Skip the batch rather than raise. This job runs for hours, and
             # letting one exhausted batch abort it would throw away every city
@@ -412,8 +440,11 @@ def build(
     started = time.time()
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     done_count = 0
+    exhausted = False
     with CACHE_PATH.open("a", encoding="utf-8") as handle:
         for missing, group_cities in groups.items():
+            if exhausted:
+                break
             start = f"{missing[0]}-01-01"
             end = f"{missing[-1]}-12-31"
             wanted = set(missing)
@@ -426,7 +457,13 @@ def build(
 
             for chunk_index, batch in enumerate(chunks):
                 batch_started = time.time()
-                results, throttled = _fetch_batch(batch, start, end, timeout=timeout)
+                try:
+                    results, throttled = _fetch_batch(batch, start, end, timeout=timeout)
+                except DailyQuotaExhausted as exc:
+                    print(f"\n  daily quota exhausted: {exc}", flush=True)
+                    print("  stopping here; re-run after it resets to continue", flush=True)
+                    exhausted = True
+                    break
 
                 if throttled:
                     pacer.on_throttled()
