@@ -65,10 +65,44 @@ Three things are worth knowing about how it runs:
   requests cities it can actually score, so the artefact can be widened toward
   the full 33,957-city index without a code change. Build it with
   `python scripts/build_climate_normals.py` (defaults to the ~6,200 cities over
-  100,000 people; `--min-population 0` for the whole index). The run is
-  rate-limited, self-pacing and resumable — see the script's docstring, which
-  also records why deduplicating nearby cities onto a grid was tried and
-  rejected.
+  100,000 people across 3 years; `--min-population 0` for the whole index). The
+  run is rate-limited, self-pacing and resumable — see the script's docstring,
+  which also records why deduplicating nearby cities onto a grid was tried and
+  rejected. Expect to re-run it: Open-Meteo's **daily** quota is what ends a
+  run, not its pace, so a full-index build is measured in weeks.
+
+### The daily cache
+
+The fetch does not store normals. It stores the daily values Open-Meteo
+returned, in `app/data/.climate_normals.v2.daily.jsonl` (gitignored), one line
+per city and calendar year, quantised to a tenth as `int16` — about 2 KB a line,
+27 MB for the default scope.
+
+Statistics are computed from that at pack time, which is what makes the two
+expensive-looking decisions cheap:
+
+```bash
+# widen the window: fetches only the years not already cached
+python scripts/build_climate_normals.py --years 5
+
+# recompute over a shorter window, or with a robust statistic.
+# no network, no quota — the daily values are already here
+python scripts/build_climate_normals.py --write-only --years 3
+python scripts/build_climate_normals.py --write-only --statistic median-mad
+```
+
+`--statistic` matters more than it looks. The default `mean-sd` has no defence
+against extreme events in the baseline: a heat dome inside a city's June window
+raises that city's June mean *and* inflates its June sigma, and the inflated
+sigma is the greater harm — it widens the band the next event is measured
+against, so a genuine anomaly scores lower and can drop off the board entirely.
+A shorter window concentrates that effect. `median-mad` estimates sigma from the
+median absolute deviation instead and barely moves for one outlier, at the cost
+of assuming rough symmetry — weakest for humidity, which is bounded at 100% and
+piles up near saturation. That is why it is opt-in rather than the default.
+
+Because the window is a property of the pack rather than the cache, no city is
+ever fetched twice for any reason.
 - **The briefing is optional.** `briefing` is `null` whenever no Anthropic key
   is configured or the call fails. The rows are unaffected.
 

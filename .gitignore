@@ -31,5 +31,7 @@ venv/
 .ruff_cache/
 *.egg-info/
 
-# Climate-normals fetch checkpoints (resumable build state, not artefacts)
-app/data/.climate_normals.*.checkpoint.jsonl
+# Climate-normals fetch state: the v1 per-window checkpoints and the v2 daily
+# cache. Build inputs, not artefacts -- the packed climate_normals.bin.gz is
+# what ships. The v2 cache reaches tens to hundreds of MB.
+app/data/.climate_normals.*.jsonl
