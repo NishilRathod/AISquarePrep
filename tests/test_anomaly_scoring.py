@@ -186,8 +186,8 @@ def test_normals_reject_out_of_range_months(month, tmp_path):
     assert store.get(0, month) is None
 
 
-class TestUrlSplitting:
-    """The archive server rejects URIs over 8 KB, and a 414 costs the whole batch."""
+class SplittingHelpers:
+    """Shared fixtures for the two splitting suites. Holds no tests of its own."""
 
     def _script(self):
         import importlib.util
@@ -214,6 +214,10 @@ class TestUrlSplitting:
             for i in range(n)
         ]
 
+
+class TestUrlSplitting(SplittingHelpers):
+    """The archive server rejects URIs over 8 KB, and a 414 costs the whole batch."""
+
     def test_oversized_batches_are_split_until_they_fit(self):
         script = self._script()
         chunks = script.split_to_url_limit(self._cities(500), "2021-01-01", "2025-12-31")
@@ -238,3 +242,80 @@ class TestUrlSplitting:
 
     def test_empty_batch(self):
         assert self._script().split_to_url_limit([], "2021-01-01", "2025-12-31") == []
+
+
+class TestRequestSizeSplitting(SplittingHelpers):
+    """The server also caps how much data one call may *ask for*.
+
+    This is a separate limit from URL length and binds in the opposite
+    direction: 200 cities over five years is only ~4.2 KB of URL, well under
+    the 8 KB cap, and is still refused with "Your API call requests too much
+    data." A splitter that measures only the URL therefore passes a request
+    the server will reject -- which is exactly how a full-index run came to
+    fail every single batch while looking, from the URL's point of view,
+    entirely reasonable.
+    """
+
+    FIVE_YEARS = ("2021-01-01", "2025-12-31")
+
+    def test_a_batch_over_the_data_budget_is_split(self):
+        script = self._script()
+        start, end = self.FIVE_YEARS
+        # 200 x 5y is the combination measured as rejected upstream.
+        chunks = script.split_to_limits(self._cities(200), start, end)
+
+        assert len(chunks) > 1
+        days = script._window_days(start, end)
+        for chunk in chunks:
+            assert len(chunk) * days <= script.MAX_LOCATION_DAYS
+
+    def test_the_url_limit_still_applies(self):
+        script = self._script()
+        # A short window leaves the data budget slack, so URL length is what
+        # has to bind here -- both constraints must be enforced, not whichever
+        # one happens to be checked first.
+        start, end = "2025-12-01", "2025-12-31"
+        chunks = script.split_to_limits(self._cities(600), start, end)
+
+        for chunk in chunks:
+            assert len(script._batch_url(chunk, start, end)) <= script.MAX_URL_CHARS
+
+    def test_every_city_survives_the_data_split(self):
+        script = self._script()
+        start, end = self.FIVE_YEARS
+        cities = self._cities(500)
+        chunks = script.split_to_limits(cities, start, end)
+
+        flattened = [city for chunk in chunks for city in chunk]
+        assert [c.geonameid for c in flattened] == [c.geonameid for c in cities]
+
+    def test_a_longer_window_means_fewer_locations_per_request(self):
+        """--years is user-facing, so the batch size has to follow the window."""
+        script = self._script()
+        cities = self._cities(400)
+
+        five = script.split_to_limits(cities, *self.FIVE_YEARS)
+        ten = script.split_to_limits(cities, "2016-01-01", "2025-12-31")
+
+        assert max(len(c) for c in ten) < max(len(c) for c in five)
+
+    def test_a_batch_within_both_limits_is_left_alone(self):
+        script = self._script()
+        cities = self._cities(20)
+        assert script.split_to_limits(cities, *self.FIVE_YEARS) == [cities]
+
+    def test_a_single_city_is_never_dropped(self):
+        """One city over budget cannot be split further; emit it rather than lose it."""
+        script = self._script()
+        cities = self._cities(1)
+        # A window long enough that even one location exceeds the budget.
+        chunks = script.split_to_limits(cities, "1940-01-01", "2025-12-31")
+        assert chunks == [cities]
+
+    def test_empty_batch_splits_to_nothing(self):
+        assert self._script().split_to_limits([], *self.FIVE_YEARS) == []
+
+    def test_window_days_is_inclusive(self):
+        script = self._script()
+        assert script._window_days("2025-01-01", "2025-01-31") == 31
+        assert script._window_days(*self.FIVE_YEARS) == 1826  # includes leap day 2024

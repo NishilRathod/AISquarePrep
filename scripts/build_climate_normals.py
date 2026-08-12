@@ -81,7 +81,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from array import array
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -104,6 +104,20 @@ STATS = 4
 # does not. Splitting below this is far better than discovering it as a dropped
 # batch, since a 414 costs the whole batch and looks like any other failure.
 MAX_URL_CHARS = 7_000
+
+# The server separately caps how much data one call may *ask for*, and that
+# limit is invisible in the URL: 200 cities x 5 years is ~4,200 characters --
+# nowhere near MAX_URL_CHARS -- and is still refused with 400 "Your API call
+# requests too much data. Please reduce the number of variables, locations
+# and/or weather models." Measured on the archive endpoint, 125 cities x 1,826
+# days (228,250 location-days) is accepted and 200 x 1,826 (365,200) is not.
+#
+# Sitting well under the measured boundary costs almost nothing, because the
+# quota is weighted by locations x days rather than by request count: splitting
+# one oversized call into two spends the same allowance and just adds a little
+# transfer overhead. Undershooting is therefore the cheap error and overshooting
+# loses the whole batch, so take the conservative number.
+MAX_LOCATION_DAYS = 200_000
 
 # Sentinel written for a city-month with too little data to characterise. NaN
 # rather than 0.0 so a missing baseline can never masquerade as a real one --
@@ -199,6 +213,42 @@ def split_to_url_limit(
     return split_to_url_limit(batch[:midpoint], start, end) + split_to_url_limit(
         batch[midpoint:], start, end
     )
+
+
+def _window_days(start: str, end: str) -> int:
+    """Days the request covers, inclusive of both endpoints."""
+    first = date.fromisoformat(start)
+    last = date.fromisoformat(end)
+    return (last - first).days + 1
+
+
+def split_to_limits(batch: list[CityRecord], start: str, end: str) -> list[list[CityRecord]]:
+    """Break a batch into chunks the server will accept, on *both* limits.
+
+    Two independent constraints, and neither implies the other. URL length
+    binds on short windows with many cities; the data budget binds on long
+    windows, where a modest, short URL can still ask for more than the server
+    will assemble. Checking only the first is how a 200-city batch over five
+    years -- 4 KB of URL, comfortably legal -- got refused every time.
+
+    The data budget is applied first, by count: with the window fixed, cities
+    per request is just a division, so there is no need to search for it. The
+    URL splitter then runs over each chunk, since coordinate strings vary in
+    length and only measurement settles that one.
+    """
+    if not batch:
+        return []
+
+    days = max(_window_days(start, end), 1)
+    # At least one city per request even for a window so long that a single
+    # location exceeds the budget -- dropping it would silently lose coverage,
+    # and a request that large is the server's call to refuse, not ours.
+    per_request = max(MAX_LOCATION_DAYS // days, 1)
+
+    chunks: list[list[CityRecord]] = []
+    for offset in range(0, len(batch), per_request):
+        chunks.extend(split_to_url_limit(batch[offset : offset + per_request], start, end))
+    return chunks
 
 
 def _fetch_batch(
@@ -408,7 +458,7 @@ def build(
     with checkpoint_path.open("a", encoding="utf-8") as checkpoint:
         chunks: list[list[CityRecord]] = []
         for offset in range(0, len(pending), batch_size):
-            chunks.extend(split_to_url_limit(pending[offset : offset + batch_size], start, end))
+            chunks.extend(split_to_limits(pending[offset : offset + batch_size], start, end))
 
         done_count = 0
         for chunk_index, batch in enumerate(chunks):
@@ -552,8 +602,10 @@ def main() -> None:
         type=int,
         default=200,
         help=(
-            "cities per request (default: 200). Automatically split further if the "
-            "URL would exceed the server's 8 KB limit."
+            "upper bound on cities per request (default: 200). Split further as "
+            "needed to stay under both server limits: the 8 KB URI cap and the "
+            "per-call data budget, which at a 5-year window allows ~109 cities. "
+            "Raising this past what the window permits therefore changes nothing."
         ),
     )
     parser.add_argument("--timeout", type=float, default=180.0, help="per-request timeout seconds")
