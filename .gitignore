@@ -35,3 +35,8 @@ venv/
 # cache. Build inputs, not artefacts -- the packed climate_normals.bin.gz is
 # what ships. The v2 cache reaches tens to hundreds of MB.
 app/data/.climate_normals.*.jsonl
+
+# Runtime state for the SessionStart fetch hook: the lock that stops two
+# sessions fetching at once, and the log its subprocess writes to.
+app/data/.normals_fetch.lock
+app/data/.normals_fetch.log

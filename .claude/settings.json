@@ -3,5 +3,20 @@
     "claude-code-setup@claude-plugins-official": true,
     "claude-mem@thedotmack": true,
     "headroom@headroom-marketplace": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/scripts/session_fetch_normals.py\"",
+            "async": true,
+            "timeout": 21600,
+            "statusMessage": "Resuming climate-normals fetch"
+          }
+        ]
+      }
+    ]
   }
 }
