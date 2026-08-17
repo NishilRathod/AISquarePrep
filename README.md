@@ -214,8 +214,15 @@ python -m venv .venv
 .venv/Scripts/activate   # on Windows; use `source .venv/bin/activate` on macOS/Linux
 pip install -e ".[dev]"
 
-# start a local Redis (or point REDIS_URL at one you already have running)
-docker run --rm -p 6379:6379 redis:7-alpine
+# start a local Redis (or point REDIS_URL at one you already have running).
+# The named volume and the AOF are not optional extras: cities added through the
+# UI live in `tracked:cities`, which is user intent rather than cache. With
+# `--rm` and no volume, Redis writes to an anonymous volume that the next
+# `docker run` will not reattach to, so every added city is silently gone on the
+# next start. Compose gets this right already (see docker-compose.yml).
+docker run -d --name aisq-redis -p 6379:6379 \
+  -v aisq-redis-data:/data \
+  redis:7-alpine redis-server --appendonly yes
 
 uvicorn app.main:app --reload
 ```
