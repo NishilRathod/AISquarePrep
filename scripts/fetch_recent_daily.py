@@ -155,7 +155,7 @@ def _select_cities(min_population: int, only_covered: bool) -> list[CityRecord]:
     try:
         normals = load_normals()
     except NormalsUnavailableError as exc:
-        print(f"  no usable normals artefact ({exc}); covering every selected city")
+        print(f"  no usable normals artefact ({exc}); covering every selected city", flush=True)
         return cities
 
     covered = set(normals.covered_row_indices)
@@ -298,20 +298,28 @@ def _run_phase(
     today: date,
     pacer: Pacer,
     timeout: float,
+    handle,
 ) -> tuple[int, bool]:
-    """Fetch one phase's groups into ``runs``.
+    """Fetch one phase's groups into ``runs``, appending each batch as it lands.
 
     Returns ``(city_days_cached, exhausted)``. Exhaustion is returned rather
-    than raised so the caller can still write what it has: a run that stops
-    halfway has done real work, and discarding it would mean paying for those
-    days again tomorrow.
+    than raised so the caller can still finish tidily: a run that stops halfway
+    has done real work, and discarding it would mean paying for those days
+    again tomorrow.
+
+    Records are appended per batch rather than written once at the end. This job
+    can sit in backoff for a long time behind the baseline fetch, and a run
+    killed at minute nine having written nothing would have spent real quota for
+    nothing. Append-and-last-wins is what makes that safe -- a later record for
+    a city simply supersedes an earlier one, and the compaction at the end
+    collapses the duplicates.
     """
     pending = sum(len(group) for group in groups.values())
     if not pending:
-        print(f"{label}: nothing to fetch")
+        print(f"{label}: nothing to fetch", flush=True)
         return 0, False
 
-    print(f"{label}: {pending:,} cities")
+    print(f"{label}: {pending:,} cities", flush=True)
     started = time.time()
     done = 0
     cached_days = 0
@@ -366,8 +374,13 @@ def _run_phase(
                     readings = _readings_by_date(daily)
                     if not readings:
                         continue
-                    runs[city.geonameid] = _merge(runs.get(city.geonameid), readings)
+                    run = _merge(runs.get(city.geonameid), readings)
+                    runs[city.geonameid] = run
+                    handle.write(
+                        record_line(city.geonameid, run.start, run.temps, run.humidities) + "\n"
+                    )
                     cached_days += len(readings)
+                handle.flush()
 
                 done += len(batch)
                 elapsed = time.time() - started
@@ -406,44 +419,47 @@ def fetch(
     if RECENT_PATH.exists():
         runs = parse_runs(RECENT_PATH.read_text(encoding="utf-8").splitlines())
 
-    print(f"cities={len(cities):,} through {target_end}")
+    print(f"cities={len(cities):,} through {target_end}", flush=True)
     pacer = Pacer(rate)
 
-    # Recency before history, always. The board scores each city's most recent
-    # complete day, so a city whose history is deep but whose tail is months old
-    # would sit on the board looking exactly as current as the rest.
-    cached_days, exhausted = _run_phase(
-        "recent days",
-        _recency_gaps(cities, runs, target_end, recency_days),
-        runs,
-        today,
-        pacer,
-        timeout,
-    )
-
-    if not exhausted:
-        backfilled, exhausted = _run_phase(
-            "backfill",
-            _backfill_gaps(cities, runs, since, limit_days),
+    with RECENT_PATH.open("a", encoding="utf-8") as handle:
+        # Recency before history, always. The board scores each city's most recent
+        # complete day, so a city whose history is deep but whose tail is months old
+        # would sit on the board looking exactly as current as the rest.
+        cached_days, exhausted = _run_phase(
+            "recent days",
+            _recency_gaps(cities, runs, target_end, recency_days),
             runs,
             today,
             pacer,
             timeout,
+            handle,
         )
-        cached_days += backfilled
+
+        if not exhausted:
+            backfilled, exhausted = _run_phase(
+                "backfill",
+                _backfill_gaps(cities, runs, since, limit_days),
+                runs,
+                today,
+                pacer,
+                timeout,
+                handle,
+            )
+            cached_days += backfilled
 
     if not cached_days:
         # Same reasoning as the baseline builder: a run that got nothing must
         # not rewrite the file it reads from.
-        print("\nno new days cached; leaving the recent cache as it is")
+        print("\nno new days cached; leaving the recent cache as it is", flush=True)
         return
 
     _compact(RECENT_PATH, runs)
     scoreable = sum(1 for run in runs.values() if any(t is not None for t in run.temps))
     current = sum(1 for run in runs.values() if run.end >= target_end)
     print(f"\ncached {cached_days:,} new city-days")
-    print(f"  {RECENT_PATH} -> {len(runs):,} cities, {scoreable:,} with a reading")
-    print(f"  {current:,} current through {target_end}")
+    print(f"  {RECENT_PATH} -> {len(runs):,} cities, {scoreable:,} with a reading", flush=True)
+    print(f"  {current:,} current through {target_end}", flush=True)
 
 
 def main() -> None:
