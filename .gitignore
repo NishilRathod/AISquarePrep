@@ -40,3 +40,8 @@ app/data/.climate_normals.*.jsonl
 # sessions fetching at once, and the log its subprocess writes to.
 app/data/.normals_fetch.lock
 app/data/.normals_fetch.log
+
+# Artefact of a bad ~ expansion: a tool wrote to a literal "~" directory in
+# the repo root instead of the home directory. It holds an embedded git repo,
+# so committing it produces a gitlink no clone can resolve.
+~/
