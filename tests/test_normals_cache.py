@@ -304,14 +304,14 @@ class TestDailyQuotaEndsTheRun:
     """
 
     def test_daily_exhaustion_is_recognised(self):
-        from scripts.build_climate_normals import is_daily_exhaustion
+        from scripts.open_meteo_fetch import is_daily_exhaustion
 
         assert is_daily_exhaustion(
             "Daily API request limit exceeded. Please try again tomorrow."
         )
 
     def test_shorter_windows_are_not_daily_exhaustion(self):
-        from scripts.build_climate_normals import is_daily_exhaustion
+        from scripts.open_meteo_fetch import is_daily_exhaustion
 
         assert not is_daily_exhaustion(
             "Hourly API request limit exceeded. Please try again in the next hour."
@@ -323,15 +323,16 @@ class TestDailyQuotaEndsTheRun:
 
     def test_a_daily_refusal_aborts_instead_of_retrying(self, monkeypatch):
         import scripts.build_climate_normals as script
+        import scripts.open_meteo_fetch as transport
 
         calls = {"n": 0, "slept": 0.0}
 
         def refuse(url, *, timeout):
             calls["n"] += 1
-            raise script.RateLimited("Daily API request limit exceeded.")
+            raise transport.RateLimited("Daily API request limit exceeded.")
 
-        monkeypatch.setattr(script, "_fetch", refuse)
-        monkeypatch.setattr(script.time, "sleep", lambda s: calls.__setitem__("slept", s))
+        monkeypatch.setattr(transport, "fetch_json", refuse)
+        monkeypatch.setattr(transport.time, "sleep", lambda s: calls.__setitem__("slept", s))
 
         with pytest.raises(script.DailyQuotaExhausted):
             script._fetch_batch([_city(1)], "2023-01-01", "2023-12-31", timeout=1.0)
@@ -341,15 +342,16 @@ class TestDailyQuotaEndsTheRun:
 
     def test_an_hourly_refusal_still_backs_off_and_retries(self, monkeypatch):
         import scripts.build_climate_normals as script
+        import scripts.open_meteo_fetch as transport
 
         calls = {"n": 0}
 
         def refuse(url, *, timeout):
             calls["n"] += 1
-            raise script.RateLimited("Hourly API request limit exceeded.")
+            raise transport.RateLimited("Hourly API request limit exceeded.")
 
-        monkeypatch.setattr(script, "_fetch", refuse)
-        monkeypatch.setattr(script.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(transport, "fetch_json", refuse)
+        monkeypatch.setattr(transport.time, "sleep", lambda _s: None)
 
         results, throttled = script._fetch_batch(
             [_city(1)], "2023-01-01", "2023-12-31", timeout=1.0

@@ -1,5 +1,6 @@
 import pytest
 
+import scripts.open_meteo_fetch as transport
 from app.models.anomaly import AnomalyRow
 from app.services.anomaly import MAX_PLAUSIBLE_Z, Observation, rank_by, score_city, z_score
 from app.services.city_index import CityRecord
@@ -224,7 +225,8 @@ class TestUrlSplitting(SplittingHelpers):
 
         assert len(chunks) > 1
         for chunk in chunks:
-            assert len(script._batch_url(chunk, "2021-01-01", "2025-12-31")) <= script.MAX_URL_CHARS
+            url = script._batch_url(chunk, "2021-01-01", "2025-12-31")
+            assert len(url) <= transport.MAX_URL_CHARS
 
     def test_every_city_survives_the_split(self):
         """Splitting must not drop or duplicate anyone."""
@@ -267,7 +269,7 @@ class TestRequestSizeSplitting(SplittingHelpers):
         assert len(chunks) > 1
         days = script._window_days(start, end)
         for chunk in chunks:
-            assert len(chunk) * days <= script.MAX_LOCATION_DAYS
+            assert len(chunk) * days <= transport.MAX_LOCATION_DAYS
 
     def test_the_url_limit_still_applies(self):
         script = self._script()
@@ -278,7 +280,7 @@ class TestRequestSizeSplitting(SplittingHelpers):
         chunks = script.split_to_limits(self._cities(600), start, end)
 
         for chunk in chunks:
-            assert len(script._batch_url(chunk, start, end)) <= script.MAX_URL_CHARS
+            assert len(script._batch_url(chunk, start, end)) <= transport.MAX_URL_CHARS
 
     def test_every_city_survives_the_data_split(self):
         script = self._script()
