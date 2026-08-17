@@ -162,28 +162,55 @@ def _select_cities(min_population: int, only_covered: bool) -> list[CityRecord]:
     return [city for city in cities if city.row_index in covered]
 
 
-def _wanted_ranges(
+def _recency_gaps(
+    cities: list[CityRecord],
+    runs: dict[int, Run],
+    target_end: date,
+    recency_days: int,
+) -> dict[tuple[date, date], list[CityRecord]]:
+    """Days needed to bring every city up to ``target_end``.
+
+    This phase runs before any backfill, and the order is the whole point. The
+    board scores each city's most recent complete day, so a city filled
+    oldest-first would sit on the board with a reading from months ago while
+    looking exactly as current as its neighbours -- one date per board hides it.
+    Recency first means every city is either current or absent, never quietly
+    stale.
+    """
+    floor = target_end - timedelta(days=recency_days - 1)
+    groups: dict[tuple[date, date], list[CityRecord]] = {}
+    for city in cities:
+        run = runs.get(city.geonameid)
+        start = max(run.end + timedelta(days=1), floor) if run else floor
+        if start > target_end:
+            continue
+        groups.setdefault((start, target_end), []).append(city)
+    return groups
+
+
+def _backfill_gaps(
     cities: list[CityRecord],
     runs: dict[int, Run],
     since: date,
-    target_end: date,
     limit_days: int | None,
 ) -> dict[tuple[date, date], list[CityRecord]]:
-    """Bucket cities by the span of days they are missing.
+    """History still missing *behind* each city's run, newest slice first.
 
-    A fresh city wants everything back to ``since``; a city topped up yesterday
-    wants one day. Grouping keeps the request shape uniform for both instead of
-    issuing a request per city.
+    Extending backwards rather than forwards is what lets a long backfill be
+    spread over several days without ever costing the board its currency: the
+    recent end is already there, and this only deepens the history behind it.
     """
     groups: dict[tuple[date, date], list[CityRecord]] = {}
     for city in cities:
         run = runs.get(city.geonameid)
-        start = run.end + timedelta(days=1) if run else since
-        if start > target_end:
+        if run is None:
+            continue  # nothing to extend yet; the recency phase seeds it
+        end = run.start - timedelta(days=1)
+        if end < since:
             continue
-        end = target_end
+        start = since
         if limit_days is not None:
-            end = min(end, start + timedelta(days=limit_days - 1))
+            start = max(start, end - timedelta(days=limit_days - 1))
         groups.setdefault((start, end), []).append(city)
     return groups
 
@@ -215,26 +242,33 @@ def _readings_by_date(daily: dict) -> dict[date, tuple[float | None, float | Non
     return out
 
 
-def _merge(run: Run | None, since: date, fetched: dict[date, tuple], target_end: date) -> Run:
-    """Extend a stored run with newly fetched days, filling any gap with None.
+def _merge(run: Run | None, fetched: dict[date, tuple]) -> Run:
+    """Combine a stored run with newly fetched days, filling any gap with None.
+
+    Bounds come from the data rather than from the requested window, because the
+    two phases grow the run from opposite ends: the recency phase extends it
+    forward, the backfill extends it backward. Taking the union keeps either
+    from truncating what the other added.
 
     Gaps are written rather than skipped so the run stays contiguous and every
     reading keeps its date. A missing day is a missing day; it must not slide a
     later reading into an earlier slot.
     """
-    start = run.start if run else since
-    existing = {}
+    existing: dict[date, tuple] = {}
     if run:
         for offset, (temperature, humidity) in enumerate(
             zip(run.temps, run.humidities, strict=False)
         ):
             existing[run.start + timedelta(days=offset)] = (temperature, humidity)
     existing.update(fetched)
+    if not existing:
+        return run or Run(start=date.today(), temps=[], humidities=[])
 
+    start, end = min(existing), max(existing)
     temps: list[float | None] = []
     humidities: list[float | None] = []
     day = start
-    while day <= target_end:
+    while day <= end:
         temperature, humidity = existing.get(day, (None, None))
         temps.append(temperature)
         humidities.append(humidity)
@@ -257,53 +291,46 @@ def _compact(path: Path, runs: dict[int, Run]) -> None:
     temporary.replace(path)
 
 
-def fetch(
-    since: date,
-    min_population: int,
-    only_covered: bool,
-    limit_days: int | None,
+def _run_phase(
+    label: str,
+    groups: dict[tuple[date, date], list[CityRecord]],
+    runs: dict[int, Run],
+    today: date,
+    pacer: Pacer,
     timeout: float,
-    rate: float,
-) -> None:
-    today = datetime.now(UTC).date()
-    # Yesterday, never today: today's daily mean is a partial day.
-    target_end = today - timedelta(days=1)
+) -> tuple[int, bool]:
+    """Fetch one phase's groups into ``runs``.
 
-    cities = _select_cities(min_population, only_covered)
-    RECENT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    runs: dict[int, Run] = {}
-    if RECENT_PATH.exists():
-        runs = parse_runs(RECENT_PATH.read_text(encoding="utf-8").splitlines())
-
-    groups = _wanted_ranges(cities, runs, since, target_end, limit_days)
+    Returns ``(city_days_cached, exhausted)``. Exhaustion is returned rather
+    than raised so the caller can still write what it has: a run that stops
+    halfway has done real work, and discarding it would mean paying for those
+    days again tomorrow.
+    """
     pending = sum(len(group) for group in groups.values())
-
-    print(f"cities={len(cities):,} through {target_end}")
-    print(f"already current={len(cities) - pending:,} needing days={pending:,}")
     if not pending:
-        print("nothing to fetch; the recent cache is already current")
-        return
+        print(f"{label}: nothing to fetch")
+        return 0, False
 
-    pacer = Pacer(rate)
+    print(f"{label}: {pending:,} cities")
     started = time.time()
     done = 0
-    fetched_days = 0
-    exhausted = False
+    cached_days = 0
 
     for (start, end), group_cities in groups.items():
-        if exhausted:
-            break
         for endpoint, segment_start, segment_end in plan_windows(start, end, today):
-            if exhausted:
-                break
             days = (segment_end - segment_start).days + 1
             past_days = (today - segment_start).days
 
-            def make_url(batch: Sequence[CityRecord], _e=endpoint, _s=segment_start,
-                         _end=segment_end, _p=past_days) -> str:
-                if _e == "archive":
-                    return archive_url(batch, _s, _end)
-                return forecast_url(batch, _p)
+            def make_url(
+                batch: Sequence[CityRecord],
+                _endpoint=endpoint,
+                _start=segment_start,
+                _end=segment_end,
+                _past=past_days,
+            ) -> str:
+                if _endpoint == "archive":
+                    return archive_url(batch, _start, _end)
+                return forecast_url(batch, _past)
 
             for batch in split_to_limits(group_cities, days, make_url):
                 batch_started = time.time()
@@ -312,8 +339,7 @@ def fetch(
                 except DailyQuotaExhausted as exc:
                     print(f"\n  daily quota exhausted: {exc}", flush=True)
                     print("  stopping here; re-run after it resets to continue", flush=True)
-                    exhausted = True
-                    break
+                    return cached_days, True
 
                 if throttled:
                     pacer.on_throttled()
@@ -340,10 +366,8 @@ def fetch(
                     readings = _readings_by_date(daily)
                     if not readings:
                         continue
-                    runs[city.geonameid] = _merge(
-                        runs.get(city.geonameid), since, readings, segment_end
-                    )
-                    fetched_days += len(readings)
+                    runs[city.geonameid] = _merge(runs.get(city.geonameid), readings)
+                    cached_days += len(readings)
 
                 done += len(batch)
                 elapsed = time.time() - started
@@ -360,7 +384,55 @@ def fetch(
                 if remaining > 0:
                     time.sleep(remaining)
 
-    if not fetched_days:
+    return cached_days, False
+
+
+def fetch(
+    since: date,
+    min_population: int,
+    only_covered: bool,
+    limit_days: int | None,
+    recency_days: int,
+    timeout: float,
+    rate: float,
+) -> None:
+    today = datetime.now(UTC).date()
+    # Yesterday, never today: today's daily mean is a partial day.
+    target_end = today - timedelta(days=1)
+
+    cities = _select_cities(min_population, only_covered)
+    RECENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    runs: dict[int, Run] = {}
+    if RECENT_PATH.exists():
+        runs = parse_runs(RECENT_PATH.read_text(encoding="utf-8").splitlines())
+
+    print(f"cities={len(cities):,} through {target_end}")
+    pacer = Pacer(rate)
+
+    # Recency before history, always. The board scores each city's most recent
+    # complete day, so a city whose history is deep but whose tail is months old
+    # would sit on the board looking exactly as current as the rest.
+    cached_days, exhausted = _run_phase(
+        "recent days",
+        _recency_gaps(cities, runs, target_end, recency_days),
+        runs,
+        today,
+        pacer,
+        timeout,
+    )
+
+    if not exhausted:
+        backfilled, exhausted = _run_phase(
+            "backfill",
+            _backfill_gaps(cities, runs, since, limit_days),
+            runs,
+            today,
+            pacer,
+            timeout,
+        )
+        cached_days += backfilled
+
+    if not cached_days:
         # Same reasoning as the baseline builder: a run that got nothing must
         # not rewrite the file it reads from.
         print("\nno new days cached; leaving the recent cache as it is")
@@ -368,8 +440,10 @@ def fetch(
 
     _compact(RECENT_PATH, runs)
     scoreable = sum(1 for run in runs.values() if any(t is not None for t in run.temps))
-    print(f"\ncached {fetched_days:,} new city-days")
+    current = sum(1 for run in runs.values() if run.end >= target_end)
+    print(f"\ncached {cached_days:,} new city-days")
     print(f"  {RECENT_PATH} -> {len(runs):,} cities, {scoreable:,} with a reading")
+    print(f"  {current:,} current through {target_end}")
 
 
 def main() -> None:
@@ -403,6 +477,15 @@ def main() -> None:
             "spread over several days without starving the baseline fetch"
         ),
     )
+    parser.add_argument(
+        "--recency-days",
+        type=int,
+        default=7,
+        help=(
+            "how far back the recency phase will reach to bring a city up to "
+            "yesterday (default: 7). Bounds the cost of catching up after a gap"
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=180.0, help="per-request timeout seconds")
     parser.add_argument(
         "--rate",
@@ -417,6 +500,7 @@ def main() -> None:
         args.min_population,
         not args.all_cities,
         args.limit_days,
+        args.recency_days,
         args.timeout,
         args.rate,
     )

@@ -13,9 +13,10 @@ import pytest
 from app.services.city_index import CityRecord
 from app.services.recent import Run, parse_runs
 from scripts.fetch_recent_daily import (
+    _backfill_gaps,
     _merge,
     _readings_by_date,
-    _wanted_ranges,
+    _recency_gaps,
     forecast_url,
     plan_windows,
 )
@@ -92,31 +93,67 @@ class TestTodayIsExcluded:
         assert "past_days=5" in url
 
 
-class TestResume:
+class TestRecencyPhase:
+    """Every city is brought to yesterday before any history is filled in.
+
+    The board scores each city's most recent complete day and shows one date for
+    the whole board, so a city filled oldest-first would rank on a months-old
+    reading while looking exactly as current as its neighbours.
+    """
+
     def test_a_city_is_asked_only_for_the_days_it_lacks(self):
         runs = {1: Run(start=date(2026, 8, 1), temps=[1.0] * 10, humidities=[1.0] * 10)}
 
-        groups = _wanted_ranges([_city(1)], runs, date(2026, 1, 1), YESTERDAY, None)
+        groups = _recency_gaps([_city(1)], runs, YESTERDAY, 7)
 
         assert list(groups) == [(date(2026, 8, 11), YESTERDAY)]
 
     def test_a_current_city_is_not_asked_at_all(self):
         runs = {1: Run(start=date(2026, 8, 1), temps=[1.0] * 16, humidities=[1.0] * 16)}
 
-        assert _wanted_ranges([_city(1)], runs, date(2026, 1, 1), YESTERDAY, None) == {}
+        assert _recency_gaps([_city(1)], runs, YESTERDAY, 7) == {}
 
-    def test_limit_days_caps_the_span_so_a_backfill_can_be_spread(self):
-        groups = _wanted_ranges([_city(1)], {}, date(2026, 1, 1), YESTERDAY, 30)
+    def test_a_long_gap_is_bounded_by_the_recency_window(self):
+        """Catching up after weeks away must not cost weeks of quota up front."""
+        runs = {1: Run(start=date(2026, 1, 1), temps=[1.0] * 31, humidities=[1.0] * 31)}
 
-        (start, end), = groups
-        assert start == date(2026, 1, 1)
-        assert (end - start).days + 1 == 30
+        ((start, end),) = _recency_gaps([_city(1)], runs, YESTERDAY, 7)
+
+        assert (end - start).days + 1 == 7
+        assert end == YESTERDAY
 
     def test_cities_wanting_the_same_span_share_one_group(self):
-        groups = _wanted_ranges([_city(1), _city(2)], {}, date(2026, 8, 1), YESTERDAY, None)
+        groups = _recency_gaps([_city(1), _city(2)], {}, YESTERDAY, 7)
 
         assert len(groups) == 1
         assert len(next(iter(groups.values()))) == 2
+
+
+class TestBackfillPhase:
+    def test_history_is_extended_backwards_from_the_stored_run(self):
+        runs = {1: Run(start=date(2026, 8, 10), temps=[1.0] * 7, humidities=[1.0] * 7)}
+
+        ((start, end),) = _backfill_gaps([_city(1)], runs, date(2026, 1, 1), None)
+
+        assert end == date(2026, 8, 9)
+        assert start == date(2026, 1, 1)
+
+    def test_limit_days_takes_the_newest_slice_first(self):
+        """A capped backfill deepens the recent past before the distant past."""
+        runs = {1: Run(start=date(2026, 8, 10), temps=[1.0] * 7, humidities=[1.0] * 7)}
+
+        ((start, end),) = _backfill_gaps([_city(1)], runs, date(2026, 1, 1), 30)
+
+        assert end == date(2026, 8, 9)
+        assert (end - start).days + 1 == 30
+
+    def test_a_city_with_no_run_is_left_to_the_recency_phase(self):
+        assert _backfill_gaps([_city(1)], {}, date(2026, 1, 1), None) == {}
+
+    def test_a_complete_history_asks_for_nothing(self):
+        runs = {1: Run(start=date(2026, 1, 1), temps=[1.0] * 30, humidities=[1.0] * 30)}
+
+        assert _backfill_gaps([_city(1)], runs, date(2026, 1, 1), None) == {}
 
 
 class TestResponseAlignment:
@@ -147,9 +184,7 @@ class TestMerging:
     def test_new_days_extend_the_stored_run(self):
         run = Run(start=date(2026, 8, 14), temps=[10.0], humidities=[50.0])
 
-        merged = _merge(
-            run, date(2026, 8, 14), {date(2026, 8, 15): (11.0, 55.0)}, date(2026, 8, 15)
-        )
+        merged = _merge(run, {date(2026, 8, 15): (11.0, 55.0)})
 
         assert merged.start == date(2026, 8, 14)
         assert merged.temps == [10.0, 11.0]
@@ -157,27 +192,40 @@ class TestMerging:
 
     def test_a_missing_day_is_held_open_rather_than_closed_up(self):
         """A gap must not slide a later reading into an earlier day's slot."""
-        merged = _merge(
-            None, date(2026, 8, 14), {date(2026, 8, 16): (12.0, 60.0)}, date(2026, 8, 16)
-        )
+        run = Run(start=date(2026, 8, 14), temps=[10.0], humidities=[50.0])
 
-        assert merged.temps == [None, None, 12.0]
+        merged = _merge(run, {date(2026, 8, 16): (12.0, 60.0)})
+
+        assert merged.temps == [10.0, None, 12.0]
         assert merged.start == date(2026, 8, 14)
+
+    def test_the_backfill_extends_the_run_backwards(self):
+        """The two phases grow the run from opposite ends; neither may truncate."""
+        run = Run(start=date(2026, 8, 14), temps=[10.0], humidities=[50.0])
+
+        merged = _merge(run, {date(2026, 8, 12): (8.0, 40.0)})
+
+        assert merged.start == date(2026, 8, 12)
+        assert merged.end == date(2026, 8, 14)
+        assert merged.temps == [8.0, None, 10.0]
 
     def test_a_refetched_day_overwrites_rather_than_duplicates(self):
         run = Run(start=date(2026, 8, 14), temps=[10.0], humidities=[50.0])
 
-        merged = _merge(run, date(2026, 8, 14), {date(2026, 8, 14): (99.0, 9.0)}, date(2026, 8, 14))
+        merged = _merge(run, {date(2026, 8, 14): (99.0, 9.0)})
 
         assert merged.temps == [99.0]
 
     def test_a_merged_run_survives_a_round_trip_through_the_file(self):
         from app.services.recent import record_line
 
-        merged = _merge(None, date(2026, 8, 14), {date(2026, 8, 15): (11.0, 55.0)}, YESTERDAY)
+        merged = _merge(
+            Run(start=date(2026, 8, 14), temps=[10.0], humidities=[50.0]),
+            {YESTERDAY: (11.0, 55.0)},
+        )
         line = record_line(1, merged.start, merged.temps, merged.humidities)
 
         back = parse_runs([line])[1]
         assert back.start == merged.start
         assert back.end == YESTERDAY
-        assert back.temps[1] == pytest.approx(11.0, abs=0.05)
+        assert back.temps[-1] == pytest.approx(11.0, abs=0.05)
