@@ -98,10 +98,16 @@ interface AnomalyBoardProps {
   unit: string;
   rows: AnomalyRow[];
   citiesScored: number;
-  sweptAt: string | null;
+  observedDate: string | null;
 }
 
-export function AnomalyBoard({ title, unit, rows, citiesScored, sweptAt }: AnomalyBoardProps) {
+export function AnomalyBoard({
+  title,
+  unit,
+  rows,
+  citiesScored,
+  observedDate,
+}: AnomalyBoardProps) {
   const headingId = `anomaly-${title.toLowerCase()}`;
 
   return (
@@ -112,7 +118,14 @@ export function AnomalyBoard({ title, unit, rows, citiesScored, sweptAt }: Anoma
         </h2>
         <p className="tabular text-[11px]" style={{ color: "var(--color-ink-faint)" }}>
           {citiesScored.toLocaleString()} scored
-          {sweptAt && ` · ${new Date(sweptAt).toLocaleTimeString()}`}
+          {/* The day being scored, not the time the scoring ran: a board
+              recomputed at noon still describes yesterday's weather, and
+              showing the clock time invited reading it as "right now". */}
+          {observedDate &&
+            ` · ${new Date(`${observedDate}T00:00:00`).toLocaleDateString(undefined, {
+              month: "short",
+              day: "numeric",
+            })}`}
         </p>
       </header>
 

@@ -57,6 +57,24 @@ class RecentRecord:
     reading: Reading
 
 
+@dataclass(frozen=True, slots=True)
+class Run:
+    """One city's stored run of consecutive days, still in full.
+
+    The board only ever wants the last complete day, but the fetcher needs the
+    whole series so it can extend it, so both sides read the file through the
+    same parser rather than each having its own idea of the format.
+    """
+
+    start: date
+    temps: list[float | None]
+    humidities: list[float | None]
+
+    @property
+    def end(self) -> date:
+        return self.start + timedelta(days=max(len(self.temps) - 1, 0))
+
+
 def _quantise(value: float | None) -> int:
     if value is None:
         return MISSING_SENTINEL
@@ -139,13 +157,13 @@ def record_line(
     )
 
 
-def parse_records(lines: list[str]) -> dict[int, RecentRecord]:
-    """Reduce raw lines to one record per city, last line winning.
+def parse_runs(lines: list[str]) -> dict[int, Run]:
+    """Reduce raw lines to one run per city, last line winning.
 
     Last-wins is what makes the daily top-up an append rather than a rewrite:
     today's record supersedes yesterday's without touching the rest of the file.
     """
-    records: dict[int, RecentRecord] = {}
+    runs: dict[int, Run] = {}
     for line in lines:
         line = line.strip()
         if not line:
@@ -164,10 +182,18 @@ def parse_records(lines: list[str]) -> dict[int, RecentRecord]:
         if (end - start).days + 1 != len(temps):
             continue
 
-        reading = latest_complete(temps, humidities, start)
+        runs[geonameid] = Run(start=start, temps=temps, humidities=humidities)
+    return runs
+
+
+def parse_records(lines: list[str]) -> dict[int, RecentRecord]:
+    """The scoreable part of each run: its last complete day."""
+    records: dict[int, RecentRecord] = {}
+    for geonameid, run in parse_runs(lines).items():
+        reading = latest_complete(run.temps, run.humidities, run.start)
         if reading is None:
             continue  # nothing scoreable in this run
-        records[geonameid] = RecentRecord(start=start, reading=reading)
+        records[geonameid] = RecentRecord(start=run.start, reading=reading)
     return records
 
 

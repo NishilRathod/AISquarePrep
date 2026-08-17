@@ -1,26 +1,22 @@
 from array import array
+from datetime import date
 
 import pytest
 
 from app.api.deps import get_anomaly_board_service
-from app.clients.open_meteo import CurrentReading
 from app.services import anomaly_board
 from app.services.anomaly_board import AnomalyBoardService
 from app.services.city_index import CityRecord
 from app.services.normals import NormalsStore
-
-
-class StubClient:
-    def __init__(self, readings):
-        self._readings = readings
-
-    async def fetch_current_bulk(self, coordinates):
-        return self._readings
+from app.services.recent import Reading, RecentStore
 
 
 @pytest.fixture
 def board_app(app, fake_redis, monkeypatch):
-    """Wire the endpoint onto synthetic cities so it never touches upstream."""
+    """Wire the endpoint onto synthetic cities, normals and readings.
+
+    Nothing here stubs HTTP, because nothing in the read path makes a request.
+    """
     cities = [
         CityRecord(
             row_index=i,
@@ -50,13 +46,18 @@ def board_app(app, fake_redis, monkeypatch):
 
     # Temperature and humidity deliberately rank the cities in opposite orders,
     # so a board that silently used one variable for both would be obvious.
-    readings = [
-        CurrentReading(temperature_c=30.0, humidity_pct=62.0, local_date="2026-06-15"),
-        CurrentReading(temperature_c=28.0, humidity_pct=65.0, local_date="2026-06-15"),
-        CurrentReading(temperature_c=26.0, humidity_pct=70.0, local_date="2026-06-15"),
-        CurrentReading(temperature_c=24.0, humidity_pct=80.0, local_date="2026-06-15"),
-    ]
-    service = AnomalyBoardService(fake_redis, StubClient(readings), 50, None)
+    observed = date(2026, 6, 15)
+    readings = {
+        0: Reading(local_date=observed, temperature_c=30.0, humidity_pct=62.0),
+        1: Reading(local_date=observed, temperature_c=28.0, humidity_pct=65.0),
+        2: Reading(local_date=observed, temperature_c=26.0, humidity_pct=70.0),
+        3: Reading(local_date=observed, temperature_c=24.0, humidity_pct=80.0),
+    }
+    monkeypatch.setattr(
+        anomaly_board, "load_recent", lambda: RecentStore(readings=readings, as_of=observed)
+    )
+
+    service = AnomalyBoardService(fake_redis, 50, None)
     app.dependency_overrides[get_anomaly_board_service] = lambda: service
     return app
 

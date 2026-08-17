@@ -4,7 +4,6 @@ import httpx
 from fastapi import Depends, Request
 from redis.asyncio import Redis
 
-from app.clients.open_meteo import OpenMeteoClient
 from app.clients.openweather import OpenWeatherClient
 from app.clients.rate_limiter import AsyncTokenBucket
 from app.config import Settings, get_settings
@@ -53,10 +52,6 @@ def get_tracked_cities_service(redis: RedisDep, settings: SettingsDep) -> Tracke
     return TrackedCitiesService(redis, settings.tracked_cities)
 
 
-def get_open_meteo_client(http_client: HttpClientDep, settings: SettingsDep) -> OpenMeteoClient:
-    return OpenMeteoClient(http_client, settings)
-
-
 def get_briefing_provider(request: Request):
     """The interpretation layer, or ``None`` when no Anthropic key is configured."""
     return getattr(request.app.state, "briefer", None)
@@ -65,12 +60,11 @@ def get_briefing_provider(request: Request):
 def get_anomaly_board_service(
     redis: RedisDep,
     settings: SettingsDep,
-    client: Annotated[OpenMeteoClient, Depends(get_open_meteo_client)],
     briefer: Annotated[object, Depends(get_briefing_provider)],
 ) -> AnomalyBoardService:
+    """No weather client: the sweep reads both halves of its z-score from disk."""
     return AnomalyBoardService(
         redis,
-        client,
         settings.anomaly_board_size,
         briefer,  # type: ignore[arg-type]
         settings.anomaly_briefing_cache_ttl_seconds,

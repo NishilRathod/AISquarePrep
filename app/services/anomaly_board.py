@@ -1,9 +1,14 @@
 """Sweep orchestration and board storage.
 
-The sweep is global, scheduled work: it scores every city the normals artefact
-covers, stores the ranked board in Redis, and serves reads from there. Requests
-never trigger a sweep, so no user ever waits on thousands of upstream calls or
-on an LLM.
+Both halves of a z-score now come from disk: the baseline from the packed
+normals artefact, and yesterday's reading from the running year's daily cache.
+The sweep is therefore arithmetic over local files -- no upstream call sits
+between a page load and a ranking, and nothing about the board depends on the
+network being up or on a quota being unspent.
+
+It stays scheduled work writing to Redis rather than per-request work, because
+scoring thousands of cities and asking an LLM to interpret them is not something
+to do while a request waits, however cheap the reads have become.
 """
 
 from __future__ import annotations
@@ -14,11 +19,11 @@ from datetime import UTC, datetime
 
 from redis.asyncio import Redis
 
-from app.clients.open_meteo import CurrentReading, OpenMeteoClient
 from app.models.anomaly import AnomalyBoard, AnomalyBriefing, AnomalyRow
 from app.services.anomaly import Observation, rank_by, score_city
 from app.services.city_index import CityRecord, city_records
 from app.services.normals import NormalsStore, NormalsUnavailableError, load_normals
+from app.services.recent import RecentStore, RecentUnavailableError, load_recent
 from app.telemetry import tracer
 
 logger = logging.getLogger(__name__)
@@ -35,13 +40,11 @@ class AnomalyBoardService:
     def __init__(
         self,
         redis: Redis,
-        client: OpenMeteoClient,
         board_size: int,
         briefer: BriefingProvider | None = None,
         briefing_ttl_seconds: int = 21600,
     ):
         self._redis = redis
-        self._client = client
         self._board_size = board_size
         self._briefer = briefer
         self._briefing_ttl_seconds = briefing_ttl_seconds
@@ -63,38 +66,41 @@ class AnomalyBoardService:
         )
 
     async def sweep(self) -> AnomalyBoard:
-        """Fetch current conditions for every covered city, score, rank, store."""
+        """Score every city that has both a baseline and a recent reading, rank, store."""
         with tracer.start_as_current_span("anomaly.sweep") as span:
             try:
                 with tracer.start_as_current_span("anomaly.load_normals"):
                     normals = load_normals()
-            except NormalsUnavailableError as exc:
+                with tracer.start_as_current_span("anomaly.load_recent"):
+                    recent = load_recent()
+            except (NormalsUnavailableError, RecentUnavailableError) as exc:
                 span.set_attribute("sweep.skipped", True)
                 logger.warning("Anomaly sweep skipped: %s", exc)
                 return _empty_board()
 
-            # Only cities with a baseline. Fetching the rest would be a request per
-            # city whose reading is then discarded for having nothing to compare to.
+            # A city needs both halves of the z-score. Carrying one without the
+            # other would only inflate the counts: a reading with no baseline is
+            # not comparable, and a baseline with no reading has nothing to say.
             all_cities = city_records()
             cities = [
                 all_cities[row_index]
                 for row_index in normals.covered_row_indices
-                if row_index < len(all_cities)
+                if row_index < len(all_cities) and recent.get(row_index) is not None
             ]
             span.set_attribute("cities.covered", len(cities))
             span.set_attribute("cities.in_index", len(all_cities))
+            span.set_attribute("cities.with_reading", recent.cities_covered)
             logger.info(
-                "Anomaly sweep starting over %d cities with a baseline (of %d in the index)",
+                "Anomaly sweep over %d cities with both a baseline and a reading "
+                "(%d baselines, %d readings, %d in the index)",
                 len(cities),
+                normals.cities_covered,
+                recent.cities_covered,
                 len(all_cities),
             )
 
-            readings = await self._client.fetch_current_bulk(
-                [(city.latitude, city.longitude) for city in cities]
-            )
-
             with tracer.start_as_current_span("anomaly.score") as score_span:
-                scored = self._score_all(cities, readings, normals)
+                scored = self._score_all(cities, recent, normals)
                 temperature = rank_by(scored, "temperature", self._board_size)
                 humidity = rank_by(scored, "humidity", self._board_size)
                 score_span.set_attribute("cities.scored", len(scored))
@@ -116,6 +122,7 @@ class AnomalyBoardService:
                 humidity=humidity,
                 briefing=briefing,
                 swept_at=datetime.now(UTC),
+                observed_date=recent.as_of,
                 cities_scored=len(scored),
                 source="fresh",
             )
@@ -125,20 +132,19 @@ class AnomalyBoardService:
     @staticmethod
     def _score_all(
         cities: list[CityRecord],
-        readings: list[CurrentReading | None],
+        recent: RecentStore,
         normals: NormalsStore,
     ) -> list[tuple[AnomalyRow, CityRecord]]:
         scored: list[tuple[AnomalyRow, CityRecord]] = []
 
-        for city, reading in zip(cities, readings, strict=False):
+        for city in cities:
+            reading = recent.get(city.row_index)
             if reading is None:
                 continue
 
-            # Local month, from the city's own calendar day. "2026-08-10" -> 8.
-            try:
-                month = int(reading.local_date[5:7])
-            except (ValueError, IndexError):
-                continue
+            # The month of the city's own local day, so a reading is scored
+            # against the baseline for the month it actually happened in.
+            month = reading.local_date.month
 
             baseline = normals.get(city.row_index, month)
             if baseline is None:
@@ -224,6 +230,7 @@ def _empty_board() -> AnomalyBoard:
         humidity=[],
         briefing=None,
         swept_at=None,
+        observed_date=None,
         cities_scored=0,
         source="unavailable",
     )

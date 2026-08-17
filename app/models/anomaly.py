@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel
@@ -74,5 +74,10 @@ class AnomalyBoard(BaseModel):
     humidity: list[AnomalyRow]
     briefing: AnomalyBriefing | None
     swept_at: datetime | None
+    # The local day the readings are from, which is not the day the sweep ran:
+    # the board scores the last *complete* day, so this is normally yesterday.
+    # Shown rather than implied, because "how anomalous is it" is meaningless
+    # without knowing when.
+    observed_date: date | None
     cities_scored: int
     source: Literal["fresh", "stale", "unavailable"]

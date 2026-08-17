@@ -1,0 +1,426 @@
+"""Keep the running year's daily cache current, so the board never needs the network.
+
+The baseline builder answers "what is normal here in August". This answers "what
+happened here yesterday", for the same cities, into the file the app reads
+directly. With both on disk the anomaly board is arithmetic over local data: no
+upstream call sits between a page load and a ranking, and a restart cannot leave
+the board empty.
+
+Cost is the reason this is a separate job rather than part of the sweep.
+Open-Meteo weights its quota by locations x days, so one day for every city in
+the index is ~6,200 location-days -- about six cities' worth of the three-year
+baseline fetch, which is to say nothing. The one-time backfill to January is the
+only expensive part, and --limit-days exists to spread it over several runs so it
+never starves the baseline fetch of a day's allowance.
+
+Two endpoints, because neither alone can cover the range. ERA5 reanalysis lags
+about five days, so the archive cannot reach the recent past; the forecast
+endpoint serves up to 92 previous days but no further back. The split point is
+handled per request rather than per city, so a city being backfilled from
+January and a city needing only yesterday cost one request each.
+
+Cities without a baseline are skipped: a reading that cannot be scored is quota
+spent for nothing. Coverage is read from the artefact, so the set widens by
+itself as the baseline fetch progresses.
+
+    # daily top-up, the normal case
+    python scripts/fetch_recent_daily.py
+
+    # backfill a slice of the year, leaving the rest of the allowance alone
+    python scripts/fetch_recent_daily.py --since 2026-01-01 --limit-days 60
+
+Data: Open-Meteo (ERA5 archive + forecast), CC BY 4.0 -- see app/data/ATTRIBUTION.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+import urllib.parse
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.services.city_index import CityRecord, city_records  # noqa: E402
+from app.services.normals import NormalsUnavailableError, load_normals  # noqa: E402
+from app.services.recent import RECENT_PATH, Run, parse_runs, record_line  # noqa: E402
+from scripts.open_meteo_fetch import (  # noqa: E402
+    ARCHIVE_URL,
+    FORECAST_URL,
+    DailyQuotaExhausted,
+    Pacer,
+    fetch_batch,
+    split_to_limits,
+)
+
+# ERA5 is published on a delay, so the last few days are simply absent from the
+# archive. Asking for them wastes a request and returns nulls that would be
+# cached as gaps; the forecast endpoint covers that window instead.
+ARCHIVE_LAG_DAYS = 6
+
+# How far back the forecast endpoint will serve previous days.
+MAX_PAST_DAYS = 92
+
+# A day of readings per city, in the pacer's units. The pacer thinks in
+# location-years because that is what the baseline fetch spends.
+DAYS_PER_YEAR = 365.0
+
+
+def _daily_params() -> dict[str, str]:
+    return {
+        "daily": "temperature_2m_mean,relative_humidity_2m_mean",
+        # Local days, so a reading is bucketed into the day it happened in
+        # locally rather than in UTC -- near the dateline the two disagree.
+        "timezone": "auto",
+    }
+
+
+def _coords(batch: Sequence[CityRecord]) -> dict[str, str]:
+    return {
+        "latitude": ",".join(str(city.latitude) for city in batch),
+        "longitude": ",".join(str(city.longitude) for city in batch),
+    }
+
+
+def archive_url(batch: Sequence[CityRecord], start: date, end: date) -> str:
+    query = urllib.parse.urlencode(
+        {
+            **_coords(batch),
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            **_daily_params(),
+        }
+    )
+    return f"{ARCHIVE_URL}?{query}"
+
+
+def forecast_url(batch: Sequence[CityRecord], past_days: int) -> str:
+    """Previous ``past_days`` days, ending yesterday.
+
+    ``forecast_days=0`` keeps today out of the response entirely. Today's daily
+    mean is a partial day, and caching it would mean the board scored a
+    part-day mean against a whole-day baseline -- the error that manufactures
+    multi-sigma anomalies tracking the clock rather than the weather.
+    """
+    query = urllib.parse.urlencode(
+        {
+            **_coords(batch),
+            "past_days": str(past_days),
+            "forecast_days": "0",
+            **_daily_params(),
+        }
+    )
+    return f"{FORECAST_URL}?{query}"
+
+
+def plan_windows(start: date, end: date, today: date) -> list[tuple[str, date, date]]:
+    """Split a wanted range into the endpoint that can actually serve each part.
+
+    Returns ``(endpoint, start, end)`` segments in chronological order. A range
+    entirely inside the last 92 days is one forecast call; a range reaching back
+    to January is an archive call plus a forecast call for the tail the archive
+    has not caught up with yet.
+    """
+    if start > end:
+        return []
+
+    archive_end = min(end, today - timedelta(days=ARCHIVE_LAG_DAYS))
+    forecast_floor = today - timedelta(days=MAX_PAST_DAYS)
+
+    segments: list[tuple[str, date, date]] = []
+    if start <= archive_end:
+        segments.append(("archive", start, archive_end))
+
+    tail_start = max(start, archive_end + timedelta(days=1), forecast_floor)
+    if tail_start <= end:
+        segments.append(("forecast", tail_start, end))
+    return segments
+
+
+def _select_cities(min_population: int, only_covered: bool) -> list[CityRecord]:
+    """Cities worth spending quota on: big enough to rank, and scoreable.
+
+    A city with no baseline cannot be scored however current its reading is, so
+    fetching one is quota spent for nothing. Coverage comes from the artefact,
+    which the daily job repacks first, so this set widens on its own as the
+    baseline fetch progresses.
+    """
+    cities = [city for city in city_records() if city.population >= min_population]
+    if not only_covered:
+        return cities
+
+    try:
+        normals = load_normals()
+    except NormalsUnavailableError as exc:
+        print(f"  no usable normals artefact ({exc}); covering every selected city")
+        return cities
+
+    covered = set(normals.covered_row_indices)
+    return [city for city in cities if city.row_index in covered]
+
+
+def _wanted_ranges(
+    cities: list[CityRecord],
+    runs: dict[int, Run],
+    since: date,
+    target_end: date,
+    limit_days: int | None,
+) -> dict[tuple[date, date], list[CityRecord]]:
+    """Bucket cities by the span of days they are missing.
+
+    A fresh city wants everything back to ``since``; a city topped up yesterday
+    wants one day. Grouping keeps the request shape uniform for both instead of
+    issuing a request per city.
+    """
+    groups: dict[tuple[date, date], list[CityRecord]] = {}
+    for city in cities:
+        run = runs.get(city.geonameid)
+        start = run.end + timedelta(days=1) if run else since
+        if start > target_end:
+            continue
+        end = target_end
+        if limit_days is not None:
+            end = min(end, start + timedelta(days=limit_days - 1))
+        groups.setdefault((start, end), []).append(city)
+    return groups
+
+
+def _readings_by_date(daily: dict) -> dict[date, tuple[float | None, float | None]]:
+    """One city's response as a date-keyed map.
+
+    Keyed by the date the server labelled each value with, rather than by
+    position: the two endpoints return different spans, and a positional join
+    across a boundary would shift every reading onto the wrong day -- wrong in a
+    way nothing downstream could detect.
+    """
+    times = daily.get("time") or []
+    temps = daily.get("temperature_2m_mean") or []
+    humidities = daily.get("relative_humidity_2m_mean") or []
+
+    out: dict[date, tuple[float | None, float | None]] = {}
+    for index, stamp in enumerate(times):
+        try:
+            day = date.fromisoformat(stamp)
+        except (ValueError, TypeError):
+            continue
+        temperature = temps[index] if index < len(temps) else None
+        humidity = humidities[index] if index < len(humidities) else None
+        out[day] = (
+            float(temperature) if temperature is not None else None,
+            float(humidity) if humidity is not None else None,
+        )
+    return out
+
+
+def _merge(run: Run | None, since: date, fetched: dict[date, tuple], target_end: date) -> Run:
+    """Extend a stored run with newly fetched days, filling any gap with None.
+
+    Gaps are written rather than skipped so the run stays contiguous and every
+    reading keeps its date. A missing day is a missing day; it must not slide a
+    later reading into an earlier slot.
+    """
+    start = run.start if run else since
+    existing = {}
+    if run:
+        for offset, (temperature, humidity) in enumerate(
+            zip(run.temps, run.humidities, strict=False)
+        ):
+            existing[run.start + timedelta(days=offset)] = (temperature, humidity)
+    existing.update(fetched)
+
+    temps: list[float | None] = []
+    humidities: list[float | None] = []
+    day = start
+    while day <= target_end:
+        temperature, humidity = existing.get(day, (None, None))
+        temps.append(temperature)
+        humidities.append(humidity)
+        day += timedelta(days=1)
+    return Run(start=start, temps=temps, humidities=humidities)
+
+
+def _compact(path: Path, runs: dict[int, Run]) -> None:
+    """Rewrite the file as one line per city.
+
+    The format is append-and-last-wins, which is what makes a daily top-up cheap,
+    but left alone the file would grow by a full copy of every city every day.
+    Rewriting through a temporary file keeps a crash mid-write from destroying
+    the cache.
+    """
+    temporary = path.with_suffix(".compacting")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for geonameid, run in runs.items():
+            handle.write(record_line(geonameid, run.start, run.temps, run.humidities) + "\n")
+    temporary.replace(path)
+
+
+def fetch(
+    since: date,
+    min_population: int,
+    only_covered: bool,
+    limit_days: int | None,
+    timeout: float,
+    rate: float,
+) -> None:
+    today = datetime.now(UTC).date()
+    # Yesterday, never today: today's daily mean is a partial day.
+    target_end = today - timedelta(days=1)
+
+    cities = _select_cities(min_population, only_covered)
+    RECENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    runs: dict[int, Run] = {}
+    if RECENT_PATH.exists():
+        runs = parse_runs(RECENT_PATH.read_text(encoding="utf-8").splitlines())
+
+    groups = _wanted_ranges(cities, runs, since, target_end, limit_days)
+    pending = sum(len(group) for group in groups.values())
+
+    print(f"cities={len(cities):,} through {target_end}")
+    print(f"already current={len(cities) - pending:,} needing days={pending:,}")
+    if not pending:
+        print("nothing to fetch; the recent cache is already current")
+        return
+
+    pacer = Pacer(rate)
+    started = time.time()
+    done = 0
+    fetched_days = 0
+    exhausted = False
+
+    for (start, end), group_cities in groups.items():
+        if exhausted:
+            break
+        for endpoint, segment_start, segment_end in plan_windows(start, end, today):
+            if exhausted:
+                break
+            days = (segment_end - segment_start).days + 1
+            past_days = (today - segment_start).days
+
+            def make_url(batch: Sequence[CityRecord], _e=endpoint, _s=segment_start,
+                         _end=segment_end, _p=past_days) -> str:
+                if _e == "archive":
+                    return archive_url(batch, _s, _end)
+                return forecast_url(batch, _p)
+
+            for batch in split_to_limits(group_cities, days, make_url):
+                batch_started = time.time()
+                try:
+                    results, throttled = fetch_batch(batch, make_url, timeout=timeout)
+                except DailyQuotaExhausted as exc:
+                    print(f"\n  daily quota exhausted: {exc}", flush=True)
+                    print("  stopping here; re-run after it resets to continue", flush=True)
+                    exhausted = True
+                    break
+
+                if throttled:
+                    pacer.on_throttled()
+                else:
+                    pacer.on_success()
+
+                if results is None:
+                    continue
+
+                # Cities are matched to results by position, so a short or long
+                # response would shift every city onto its neighbour's weather.
+                if len(results) != len(batch):
+                    print(
+                        f"    length mismatch: sent {len(batch)}, got {len(results)}"
+                        " -- batch dropped",
+                        flush=True,
+                    )
+                    continue
+
+                for city, result in zip(batch, results, strict=True):
+                    daily = result.get("daily") if isinstance(result, dict) else None
+                    if not daily:
+                        continue
+                    readings = _readings_by_date(daily)
+                    if not readings:
+                        continue
+                    runs[city.geonameid] = _merge(
+                        runs.get(city.geonameid), since, readings, segment_end
+                    )
+                    fetched_days += len(readings)
+
+                done += len(batch)
+                elapsed = time.time() - started
+                print(
+                    f"  {done:>6,}/{pending:,} cities  "
+                    f"{endpoint:<8} {segment_start}..{segment_end}  "
+                    f"{done / elapsed * 60 if elapsed else 0:>5.0f} cities/min",
+                    flush=True,
+                )
+
+                remaining = pacer.seconds_between(len(batch) * days / DAYS_PER_YEAR) - (
+                    time.time() - batch_started
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
+
+    if not fetched_days:
+        # Same reasoning as the baseline builder: a run that got nothing must
+        # not rewrite the file it reads from.
+        print("\nno new days cached; leaving the recent cache as it is")
+        return
+
+    _compact(RECENT_PATH, runs)
+    scoreable = sum(1 for run in runs.values() if any(t is not None for t in run.temps))
+    print(f"\ncached {fetched_days:,} new city-days")
+    print(f"  {RECENT_PATH} -> {len(runs):,} cities, {scoreable:,} with a reading")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--since",
+        type=date.fromisoformat,
+        default=date(datetime.now(UTC).year, 1, 1),
+        help="first day to cache for a city with no record yet (default: Jan 1 this year)",
+    )
+    parser.add_argument(
+        "--min-population",
+        type=int,
+        default=100_000,
+        help="skip cities smaller than this (default: 100,000, matching the baseline build)",
+    )
+    parser.add_argument(
+        "--all-cities",
+        action="store_true",
+        help=(
+            "fetch cities with no baseline too. Off by default: their readings "
+            "cannot be scored, so the quota buys nothing"
+        ),
+    )
+    parser.add_argument(
+        "--limit-days",
+        type=int,
+        default=None,
+        help=(
+            "cap the days fetched per city in this run, so a long backfill can be "
+            "spread over several days without starving the baseline fetch"
+        ),
+    )
+    parser.add_argument("--timeout", type=float, default=180.0, help="per-request timeout seconds")
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=60.0,
+        help="starting pace in location-years/min; adapts from there",
+    )
+    args = parser.parse_args()
+
+    fetch(
+        args.since,
+        args.min_population,
+        not args.all_cities,
+        args.limit_days,
+        args.timeout,
+        args.rate,
+    )
+
+
+if __name__ == "__main__":
+    main()

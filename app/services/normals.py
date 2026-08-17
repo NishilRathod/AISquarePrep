@@ -15,7 +15,6 @@ import json
 import math
 from array import array
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 from app.services.city_index import city_records
@@ -118,8 +117,34 @@ def geonameid_digest(geonameids: list[int]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
-@lru_cache(maxsize=1)
+_cache: tuple[tuple[float, int], NormalsStore] | None = None
+
+
 def load_normals() -> NormalsStore:
+    """Load the artefact, re-reading it when the file has changed.
+
+    Keyed on mtime and size rather than cached outright. The artefact is now
+    repacked daily from the growing daily cache, and a store held for the life of
+    the process would pin the board to whatever coverage existed at boot -- new
+    cities would keep arriving in the cache and never reach the board.
+    """
+    global _cache
+
+    if NORMALS_PATH.exists():
+        stat = NORMALS_PATH.stat()
+        stamp = (stat.st_mtime, stat.st_size)
+        if _cache is not None and _cache[0] == stamp:
+            return _cache[1]
+    else:
+        stamp = None
+
+    store = _read_normals()
+    if stamp is not None:
+        _cache = (stamp, store)
+    return store
+
+
+def _read_normals() -> NormalsStore:
     if not NORMALS_PATH.exists() or not META_PATH.exists():
         raise NormalsUnavailableError(
             f"climate normals artefact missing at {NORMALS_PATH}; "

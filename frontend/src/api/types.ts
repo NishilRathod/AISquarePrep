@@ -90,10 +90,19 @@ export interface AnomalyBriefing {
 }
 
 export interface AnomalyBoard {
-  rows: AnomalyRow[];
+  /** Two rankings over the same scoring pass, one per variable. A city can
+   *  appear on both, with a different headline on each. */
+  temperature: AnomalyRow[];
+  humidity: AnomalyRow[];
   /** Null whenever the interpretation layer is unavailable. The rows stand alone. */
   briefing: AnomalyBriefing | null;
   swept_at: string | null;
+  /**
+   * The local day the readings are from -- normally yesterday, since the board
+   * scores the last *complete* day. Not the same as swept_at, which is only
+   * when the scoring last ran.
+   */
+  observed_date: string | null;
   cities_scored: number;
   source: "fresh" | "stale" | "unavailable";
 }

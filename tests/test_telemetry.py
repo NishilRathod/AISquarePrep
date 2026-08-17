@@ -16,7 +16,13 @@ from app.clients.anthropic import AnomalyBriefingClient
 from app.services import anomaly_board
 from app.services.anomaly_board import AnomalyBoardService
 from tests.test_anomaly_board import BRIEFING as BOARD_BRIEFING
-from tests.test_anomaly_board import StubBriefer, StubClient, make_cities, make_normals, reading
+from tests.test_anomaly_board import (
+    StubBriefer,
+    make_cities,
+    make_normals,
+    make_recent,
+    reading,
+)
 from tests.test_anomaly_briefing_client import BRIEFING, StubMessages, row
 
 
@@ -47,10 +53,14 @@ def briefing_client(settings, monkeypatch):
 
 @pytest.fixture
 def patched(monkeypatch):
-    def apply(n_cities):
+    def apply(n_cities, readings=None):
         cities = make_cities(n_cities)
         monkeypatch.setattr(anomaly_board, "city_records", lambda: cities)
         monkeypatch.setattr(anomaly_board, "load_normals", lambda: make_normals(n_cities))
+        if readings is None:
+            readings = [reading() for _ in range(n_cities)]
+        store = make_recent(readings)
+        monkeypatch.setattr(anomaly_board, "load_recent", lambda: store)
         return cities
 
     return apply
@@ -130,11 +140,9 @@ class TestSweepShape:
         self, fake_redis, patched, briefing_client, spans
     ):
         """The whole point of the trace: one tree, model call included."""
-        patched(1)
+        patched(1, readings=[reading(temp=28.0)])
         briefer, _ = briefing_client(result=BRIEFING)
-        service = AnomalyBoardService(
-            fake_redis, StubClient([reading(temp=28.0)]), 50, briefer
-        )
+        service = AnomalyBoardService(fake_redis, 50, briefer)
 
         await service.sweep()
 
@@ -148,10 +156,8 @@ class TestSweepShape:
         assert named(spans, "anomaly.score").parent.span_id == sweep.context.span_id
 
     async def test_sweep_span_carries_the_counts(self, fake_redis, patched, spans):
-        patched(3)
-        service = AnomalyBoardService(
-            fake_redis, StubClient([reading(temp=28.0), reading(temp=27.0), reading()]), 50
-        )
+        patched(3, readings=[reading(temp=28.0), reading(temp=27.0), reading()])
+        service = AnomalyBoardService(fake_redis, 50)
 
         await service.sweep()
 
@@ -167,16 +173,15 @@ class TestSweepShape:
         self, fake_redis, patched, spans
     ):
         """A sweep with no model call under it is the cache, not a silent failure."""
-        patched(1)
+        patched(1, readings=[reading(temp=28.0)])
         briefer = StubBriefer(result=BOARD_BRIEFING)
-        readings = [reading(temp=28.0)]
 
-        first = AnomalyBoardService(fake_redis, StubClient(readings), 50, briefer)
+        first = AnomalyBoardService(fake_redis, 50, briefer)
         await first.sweep()
         assert named(spans, "anomaly.briefing").attributes["briefing.cache_hit"] is False
 
         spans.clear()
-        second = AnomalyBoardService(fake_redis, StubClient(readings), 50, briefer)
+        second = AnomalyBoardService(fake_redis, 50, briefer)
         await second.sweep()
 
         assert briefer.calls == 1

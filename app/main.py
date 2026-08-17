@@ -12,7 +12,6 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 
 from app.api import anomalies, cities, health, weather
-from app.clients.open_meteo import OpenMeteoClient
 from app.clients.rate_limiter import AsyncTokenBucket
 from app.config import Settings, get_settings
 from app.exceptions import (
@@ -64,16 +63,16 @@ def _build_briefer(settings: Settings):
 async def _sweep_loop(app: FastAPI, settings: Settings) -> None:
     """Run the global sweep on a timer for the life of the process.
 
-    Deliberately sleeps *before* the first sweep so that starting the app does
-    not fire thousands of upstream requests -- use POST /anomalies/refresh to
-    populate an empty board on demand.
+    Sweeps immediately and then on the interval. It used to sleep first, because
+    a sweep meant thousands of upstream requests and doing that at every boot
+    would have been indefensible. Now that both halves of the score come from
+    local files a sweep costs a file read, and sweeping at startup is what keeps
+    a restarted app from serving an empty board until the interval elapses.
     """
     while True:
         try:
-            await asyncio.sleep(settings.anomaly_sweep_interval_seconds)
             service = AnomalyBoardService(
                 app.state.redis,
-                OpenMeteoClient(app.state.http_client, settings),
                 settings.anomaly_board_size,
                 app.state.briefer,
                 settings.anomaly_briefing_cache_ttl_seconds,
@@ -83,6 +82,11 @@ async def _sweep_loop(app: FastAPI, settings: Settings) -> None:
             raise
         except Exception:  # noqa: BLE001 - a failed sweep must not kill the loop
             logger.exception("Scheduled anomaly sweep failed; will retry next interval")
+
+        try:
+            await asyncio.sleep(settings.anomaly_sweep_interval_seconds)
+        except asyncio.CancelledError:
+            raise
 
 
 @asynccontextmanager

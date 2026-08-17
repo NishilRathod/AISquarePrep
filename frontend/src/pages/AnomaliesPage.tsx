@@ -17,7 +17,7 @@ export default function AnomaliesPage() {
     <>
       <SiteHeader
         title="Global anomalies"
-        subtitle="How far today's weather sits from each city's own normal for this month."
+        subtitle="How far the latest full day sits from each city's own normal for this month."
       />
 
       <main className="mt-6">
@@ -47,14 +47,14 @@ export default function AnomaliesPage() {
                 unit="°C"
                 rows={board!.temperature}
                 citiesScored={board!.cities_scored}
-                sweptAt={board!.swept_at}
+                observedDate={board!.observed_date}
               />
               <AnomalyBoard
                 title="Humidity"
                 unit="%"
                 rows={board!.humidity}
                 citiesScored={board!.cities_scored}
-                sweptAt={board!.swept_at}
+                observedDate={board!.observed_date}
               />
             </div>
 
@@ -62,8 +62,10 @@ export default function AnomaliesPage() {
               className="mt-4 text-[12px] leading-relaxed"
               style={{ color: "var(--color-ink-faint)" }}
             >
-              Ranked by standardized anomaly — how many standard deviations today's local daily
-              mean sits from that city's own normal for this calendar month. Each city is measured
+              Ranked by standardized anomaly — how many standard deviations the most recent
+              complete local day's mean sits from that city's own normal for this calendar month.
+              The last complete day rather than today, because a part-day mean is not the same
+              statistic as the baseline and would read as an anomaly on its own. Each city is measured
               against itself, which is what lets very different climates be compared: eight degrees
               above normal is routine somewhere with a wide seasonal spread and unprecedented
               somewhere without one. The two boards are ranked independently, so a city can appear
