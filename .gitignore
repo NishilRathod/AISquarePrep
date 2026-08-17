@@ -36,6 +36,11 @@ venv/
 # what ships. The v2 cache reaches tens to hundreds of MB.
 app/data/.climate_normals.*.jsonl
 
+# The running year's daily readings, same reasoning: a growing runtime cache the
+# fetcher appends to, not a build artefact. The board reads it directly, so it is
+# rebuilt by scripts/fetch_recent_daily.py rather than shipped.
+app/data/.climate_recent.*.jsonl
+
 # Runtime state for the SessionStart fetch hook: the lock that stops two
 # sessions fetching at once, and the log its subprocess writes to.
 app/data/.normals_fetch.lock
