@@ -10,6 +10,12 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/scripts/session_cache_status.py\"",
+            "timeout": 30,
+            "statusMessage": "Reading climate cache state"
+          },
+          {
+            "type": "command",
             "command": "python \"${CLAUDE_PROJECT_DIR:-.}/scripts/session_fetch_normals.py\"",
             "async": true,
             "timeout": 21600,
