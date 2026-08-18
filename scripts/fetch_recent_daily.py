@@ -291,6 +291,20 @@ def _compact(path: Path, runs: dict[int, Run]) -> None:
     temporary.replace(path)
 
 
+def _work_units(groups: dict[tuple[date, date], list[CityRecord]], today: date) -> int:
+    """How many city-fetches a phase's groups amount to.
+
+    A range straddling the archive/forecast seam is two requests for the same
+    city, and progress ticks once per request as it lands. So the total has to
+    count requests too: counting cities instead made a healthy run report
+    ``7,620/3,810`` and look like it had lost track of its own workload.
+    """
+    return sum(
+        len(cities) * len(plan_windows(start, end, today))
+        for (start, end), cities in groups.items()
+    )
+
+
 def _run_phase(
     label: str,
     groups: dict[tuple[date, date], list[CityRecord]],
@@ -314,12 +328,15 @@ def _run_phase(
     a city simply supersedes an earlier one, and the compaction at the end
     collapses the duplicates.
     """
-    pending = sum(len(group) for group in groups.values())
-    if not pending:
+    cities_pending = sum(len(group) for group in groups.values())
+    if not cities_pending:
         print(f"{label}: nothing to fetch", flush=True)
         return 0, False
 
-    print(f"{label}: {pending:,} cities", flush=True)
+    # Two totals because they answer different questions: how much of the index
+    # this phase touches, and how many requests that costs.
+    pending = _work_units(groups, today)
+    print(f"{label}: {cities_pending:,} cities, {pending:,} fetches", flush=True)
     started = time.time()
     done = 0
     cached_days = 0
@@ -385,9 +402,9 @@ def _run_phase(
                 done += len(batch)
                 elapsed = time.time() - started
                 print(
-                    f"  {done:>6,}/{pending:,} cities  "
+                    f"  {done:>6,}/{pending:,} fetches  "
                     f"{endpoint:<8} {segment_start}..{segment_end}  "
-                    f"{done / elapsed * 60 if elapsed else 0:>5.0f} cities/min",
+                    f"{done / elapsed * 60 if elapsed else 0:>5.0f} fetches/min",
                     flush=True,
                 )
 

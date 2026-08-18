@@ -17,6 +17,7 @@ from scripts.fetch_recent_daily import (
     _merge,
     _readings_by_date,
     _recency_gaps,
+    _work_units,
     forecast_url,
     plan_windows,
 )
@@ -229,3 +230,43 @@ class TestMerging:
         assert back.start == merged.start
         assert back.end == YESTERDAY
         assert back.temps[-1] == pytest.approx(11.0, abs=0.05)
+
+
+class TestProgressAccounting:
+    """The denominator has to count whatever the numerator counts.
+
+    A range straddling the archive/forecast seam is two requests for the same
+    city, and the progress line ticks once per request as it lands. Totalling
+    cities instead made a healthy run report ``7,620/3,810 cities`` -- a number
+    that reads as a bug in the fetch itself rather than in the counting.
+    """
+
+    def test_a_city_spanning_both_endpoints_counts_twice(self):
+        groups = {(date(2026, 1, 1), YESTERDAY): [_city(1)]}
+
+        assert _work_units(groups, TODAY) == 2
+
+    def test_a_city_inside_one_endpoint_counts_once(self):
+        groups = {(date(2026, 8, 14), YESTERDAY): [_city(1)]}
+
+        assert _work_units(groups, TODAY) == 1
+
+    def test_every_city_in_a_group_carries_the_group_s_segments(self):
+        groups = {(date(2026, 1, 1), YESTERDAY): [_city(1), _city(2)]}
+
+        assert _work_units(groups, TODAY) == 4
+
+    def test_the_total_matches_what_a_completed_phase_would_tick(self):
+        """Walk the same loop the fetch walks, and count what it would report."""
+        groups = {
+            (date(2026, 1, 1), YESTERDAY): [_city(1), _city(2)],
+            (date(2026, 8, 14), YESTERDAY): [_city(3)],
+        }
+
+        ticked = sum(
+            len(cities)
+            for (start, end), cities in groups.items()
+            for _ in plan_windows(start, end, TODAY)
+        )
+
+        assert _work_units(groups, TODAY) == ticked
